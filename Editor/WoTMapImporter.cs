@@ -1,0 +1,645 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using UnityEditor;
+using UnityEngine;
+using WoTMapImporter.Editor.Data;
+using WoTMapImporter.Editor.Package;
+using WoTMapImporter.Editor.Terrain;
+using WoTMapImporter.Editor.Utils;
+using WoTMapImporter.Editor.Xml;
+
+namespace WoTMapImporter.Editor
+{
+    /// <summary>
+    /// Orchestrates the full WoT map import flow.
+    ///
+    /// Architecture (mirrors Simi4's Blender addon):
+    ///   1. EXTRACT the relevant .pkg files to a temp directory on disk.
+    ///      This is how the original addon reads everything - it never reads
+    ///      from ZipFile directly for terrain.
+    ///   2. Read space.settings (old) or space.bin (new) from the extracted dir.
+    ///   3. Open every *.cdata file in spaces/&lt;map_name&gt;/ (terrain chunks).
+    ///   4. Open every *.chunk file (static model placements).
+    ///   5. Read textures/models from the extracted dir + any shared*.pkg.
+    /// </summary>
+    public static class WoTMapImporter
+    {
+        public enum TerrainImportMode
+        {
+            UnityTerrain = 0,
+            MeshChunks = 1,
+        }
+
+        public class ImportSettings
+        {
+            public bool LoadObjects = true;
+            public bool LoadNormals = true;
+            public bool LoadWetness = false;
+            public int MaxHeightmapResolution = 4097;
+            public TerrainImportMode TerrainMode = TerrainImportMode.MeshChunks;
+        }
+
+        public class ImportResult
+        {
+            public GameObject Root;
+            public TerrainData TerrainData;
+            public List<string> Warnings = new List<string>();
+            public List<string> Errors = new List<string>();
+            public TimeSpan Duration;
+        }
+
+        public static ImportResult ImportMap(
+            MapInfo mapInfo,
+            string wotResPath,
+            string outputFolder,
+            ImportSettings settings,
+            Action<float, string> progress = null)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var result = new ImportResult();
+            WoTLogger.Info($"=== Importing {mapInfo.Name} ===");
+
+            string geometry = string.IsNullOrEmpty(mapInfo.Geometry)
+                ? $"spaces/{mapInfo.Name}" : mapInfo.Geometry;
+            string spaceName = geometry.IndexOf('/') >= 0
+                ? geometry.Substring(geometry.IndexOf('/') + 1) : geometry;
+
+            progress?.Invoke(0.05f, "Extracting .pkg files...");
+
+            // 1. Extract relevant .pkg files to a temp directory.
+            string extractDir = Path.Combine(Path.GetTempPath(), "WoTMapImporter", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(extractDir);
+            WoTLogger.Info($"Extract dir: {extractDir}");
+
+            WoTPackageManager pkgMgr = null;
+            try
+            {
+                ExtractMapPackages(wotResPath, spaceName, extractDir, progress);
+
+                // The actual map content lives in <extractDir>/spaces/<map_name>/
+                string spaceDir = Path.Combine(extractDir, geometry.Replace('/', Path.DirectorySeparatorChar));
+                WoTLogger.Info($"Space dir: {spaceDir} (exists: {Directory.Exists(spaceDir)})");
+
+                // Open map packages + shared*.pkg for resource lookups (textures/models).
+                // Terrain layer textures can live in the map package itself, so using
+                // shared*.pkg only is not enough for the mesh-terrain renderer.
+                var resourcePackages = GetSharedPackageNames(wotResPath);
+                resourcePackages.Insert(0, "particles.pkg");
+                resourcePackages.Insert(0, $"{spaceName}_bin.pkg");
+                resourcePackages.Insert(0, $"{spaceName}.pkg");
+                pkgMgr = new WoTPackageManager(wotResPath, resourcePackages);
+
+                progress?.Invoke(0.15f, "Loading space settings...");
+                UniversalTerrain universalTerrain = LoadTerrainMetadata(spaceDir, pkgMgr, geometry);
+
+                progress?.Invoke(0.3f, "Loading cdata chunks...");
+                var chunks = LoadAllChunks(spaceDir, universalTerrain);
+
+                if (chunks.Count == 0)
+                {
+                    result.Errors.Add("No terrain chunks found at " + spaceDir);
+                    return result;
+                }
+
+                var folder = $"{outputFolder}/{mapInfo.Name}";
+
+                progress?.Invoke(0.7f, settings.TerrainMode == TerrainImportMode.MeshChunks
+                    ? "Building WoT mesh terrain chunks..."
+                    : "Building Unity Terrain...");
+
+                GameObject terrainObject = null;
+                if (settings.TerrainMode == TerrainImportMode.MeshChunks)
+                {
+                    var meshResult = TerrainMeshBuilder.Build(folder, mapInfo, universalTerrain, chunks, pkgMgr,
+                                                              settings.LoadWetness);
+                    terrainObject = meshResult.TerrainObject;
+                    result.Warnings.AddRange(meshResult.Warnings);
+                }
+                else
+                {
+                    var buildResult = TerrainBuilder.Build(folder, mapInfo, universalTerrain, chunks, pkgMgr,
+                                                           settings.MaxHeightmapResolution);
+                    terrainObject = buildResult.TerrainObject;
+                    result.TerrainData = buildResult.TerrainData;
+                    result.Warnings.AddRange(buildResult.Warnings);
+                }
+
+                progress?.Invoke(0.9f, "Creating root object...");
+                var root = new GameObject($"WoTMap_{mapInfo.Name}");
+                if (terrainObject != null)
+                    terrainObject.transform.SetParent(root.transform, false);
+
+                // ---- Static objects (from compiled space.bin) ----
+                if (settings.LoadObjects)
+                {
+                    try
+                    {
+                        progress?.Invoke(0.93f, "Loading static objects...");
+                        LoadStaticObjects(spaceDir, $"{outputFolder}/{mapInfo.Name}", pkgMgr, root, result);
+                    }
+                    catch (Exception oe)
+                    {
+                        WoTLogger.Warn($"Static object loading failed: {oe.Message}\n{oe.StackTrace}");
+                        result.Warnings.Add("Object loading failed: " + oe.Message);
+                    }
+                }
+
+                result.Root = root;
+                string prefabPath = $"{folder}/WoTMap_{mapInfo.Name}.prefab";
+                PrefabUtility.SaveAsPrefabAsset(root, prefabPath);
+
+                progress?.Invoke(1.0f, "Done.");
+            }
+            catch (Exception e)
+            {
+                WoTLogger.Error($"Import failed: {e.Message}\n{e.StackTrace}");
+                result.Errors.Add(e.Message);
+            }
+            finally
+            {
+                pkgMgr?.Dispose();
+                // Clean up extract dir asynchronously
+                try { Directory.Delete(extractDir, recursive: true); }
+                catch (Exception ex) { WoTLogger.Warn($"Could not clean up extract dir: {ex.Message}"); }
+            }
+
+            sw.Stop();
+            result.Duration = sw.Elapsed;
+            WoTLogger.Info($"=== Import finished in {sw.Elapsed.TotalSeconds:F2}s ===");
+            return result;
+        }
+
+        // =================== EXTRACTION ===================
+
+        private static void ExtractMapPackages(
+            string wotResPath, string spaceName, string extractDir,
+            Action<float, string> progress)
+        {
+            // Extract the map's main package + _bin package + particles package.
+            // This matches Simi4's loader.extract_space_pkg().
+            string[] packagesToExtract = {
+                $"{spaceName}.pkg",
+                $"{spaceName}_bin.pkg",
+                "particles.pkg",
+            };
+
+            int extracted = 0;
+            foreach (var pkgName in packagesToExtract)
+            {
+                string pkgPath = Path.Combine(wotResPath, pkgName);
+                if (File.Exists(pkgPath))
+                {
+                    ExtractZip(pkgPath, extractDir);
+                    WoTLogger.Info($"Extracted {pkgName}");
+                }
+                else
+                {
+                    WoTLogger.Warn($"pkg not found (skipping): {pkgName}");
+                }
+                extracted++;
+                progress?.Invoke(0.05f + 0.05f * extracted, $"Extracted {extracted}/{packagesToExtract.Length}...");
+            }
+        }
+
+        private static List<string> GetSharedPackageNames(string wotResPath)
+        {
+            var list = new List<string>();
+            string pkgsDir = wotResPath;
+            if (!Directory.Exists(pkgsDir)) return list;
+            foreach (var f in Directory.GetFiles(pkgsDir, "shared*.pkg"))
+            {
+                string fname = Path.GetFileName(f);
+                if (fname.Contains("_hd-")) continue;
+                list.Add(fname);
+            }
+            return list;
+        }
+
+        private static void ExtractZip(string zipPath, string destDir)
+        {
+            using var zip = ZipFile.OpenRead(zipPath);
+            foreach (var entry in zip.Entries)
+            {
+                // Skip directory entries
+                if (string.IsNullOrEmpty(entry.Name)) continue;
+
+                string outPath = Path.Combine(destDir, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+                using var fs = entry.Open();
+                using var outFs = File.Create(outPath);
+                fs.CopyTo(outFs);
+            }
+        }
+
+        // =================== TERRAIN METADATA ===================
+
+        private static UniversalTerrain LoadTerrainMetadata(
+            string spaceDir, WoTPackageManager pkgMgr, string geometry)
+        {
+            var ut = new UniversalTerrain { ChunkSize = 100f };
+
+            // Old format: space.settings XML
+            string settingsPath = Path.Combine(spaceDir, "space.settings");
+            if (File.Exists(settingsPath))
+            {
+                try
+                {
+                    var doc = XmlUnpacker.ReadBytes(File.ReadAllBytes(settingsPath));
+                    ut.MinX = int.Parse(doc.SelectSingleNode("/root/bounds/minX").InnerText.Trim());
+                    ut.MaxX = int.Parse(doc.SelectSingleNode("/root/bounds/maxX").InnerText.Trim());
+                    ut.MinY = int.Parse(doc.SelectSingleNode("/root/bounds/minY").InnerText.Trim());
+                    ut.MaxY = int.Parse(doc.SelectSingleNode("/root/bounds/maxY").InnerText.Trim());
+                    WoTLogger.Info($"space.settings bounds: x[{ut.MinX}..{ut.MaxX}] y[{ut.MinY}..{ut.MaxY}]");
+                    return ut;
+                }
+                catch (Exception e)
+                {
+                    WoTLogger.Warn($"Could not parse space.settings: {e.Message}");
+                }
+            }
+
+            // New format: space.bin (compiled space).  We only need BWT2.settings
+            // here: chunk_size, bounds, normal_map_fnv, global_map_fnv, noise_fnv.
+            string spaceBinPath = Path.Combine(spaceDir, "space.bin");
+            if (File.Exists(spaceBinPath))
+            {
+                try
+                {
+                    if (TryReadCompiledTerrainMetadata(File.ReadAllBytes(spaceBinPath), ut))
+                    {
+                        WoTLogger.Info($"space.bin BWT2 terrain: chunkSize={ut.ChunkSize} bounds x[{ut.MinX}..{ut.MaxX}] y[{ut.MinY}..{ut.MaxY}] globalMap='{ut.GlobalMap}'");
+                        return ut;
+                    }
+                }
+                catch (Exception e)
+                {
+                    WoTLogger.Warn($"Could not parse BWT2 terrain metadata: {e.Message}");
+                }
+            }
+
+            // Fallback: derive from cdata files later; keep zero bounds for now.
+            ut.MinX = ut.MinY = 0;
+            ut.MaxX = ut.MaxY = 0;
+            return ut;
+        }
+
+        private struct SpaceRow
+        {
+            public string Header;
+            public uint Position;
+            public uint Length;
+        }
+
+        private static bool TryReadCompiledTerrainMetadata(byte[] bin, UniversalTerrain ut)
+        {
+            using var ms = new MemoryStream(bin, false);
+            using var br = new BinaryReader(ms);
+
+            var rows = ReadSpaceRows(br);
+            if (!rows.TryGetValue("BWT2", out var bwt2))
+                return false;
+
+            var strings = rows.TryGetValue("BWST", out var bwst)
+                ? ReadSpaceStringTable(br, bwst)
+                : new Dictionary<uint, string>();
+
+            br.BaseStream.Position = bwt2.Position;
+            uint settingsSize = br.ReadUInt32();
+            if (settingsSize < 32)
+                return false;
+
+            ut.ChunkSize = br.ReadSingle();
+            ut.MinX = br.ReadInt32();
+            ut.MaxX = br.ReadInt32();
+            ut.MinY = br.ReadInt32();
+            ut.MaxY = br.ReadInt32();
+            uint normalMapFnv = br.ReadUInt32();
+            uint globalMapFnv = br.ReadUInt32();
+            uint noiseFnv = br.ReadUInt32();
+
+            if (strings.TryGetValue(globalMapFnv, out var globalMap))
+                ut.GlobalMap = globalMap.ToLowerInvariant();
+            else if (globalMapFnv != 0)
+                WoTLogger.Warn($"BWT2 global_map_fnv 0x{globalMapFnv:X8} was not found in BWST");
+
+            return ut.ChunkSize > 0.01f;
+        }
+
+        private static Dictionary<string, SpaceRow> ReadSpaceRows(BinaryReader br)
+        {
+            br.BaseStream.Position = 0;
+            string rootHeader = ReadSpaceHeader(br);
+            if (rootHeader != "BWTB") throw new Exception($"Not a compiled space, root={rootHeader}");
+            br.ReadUInt32();
+            br.ReadUInt32();
+            br.ReadUInt32();
+            br.ReadUInt32();
+            uint rowsNum = br.ReadUInt32();
+
+            var rows = new Dictionary<string, SpaceRow>();
+            for (uint i = 0; i < rowsNum; i++)
+            {
+                string h = ReadSpaceHeader(br);
+                br.ReadUInt32();
+                uint pos = br.ReadUInt32();
+                br.ReadUInt32();
+                uint len = br.ReadUInt32();
+                br.ReadUInt32();
+                rows[h] = new SpaceRow { Header = h, Position = pos, Length = len };
+            }
+            return rows;
+        }
+
+        private static string ReadSpaceHeader(BinaryReader br)
+        {
+            return System.Text.Encoding.ASCII.GetString(br.ReadBytes(4));
+        }
+
+        private static Dictionary<uint, string> ReadSpaceStringTable(BinaryReader br, SpaceRow row)
+        {
+            var result = new Dictionary<uint, string>();
+            if (row.Length == 0) return result;
+            br.BaseStream.Position = row.Position;
+
+            uint elemSize = br.ReadUInt32();
+            uint count = br.ReadUInt32();
+            var entries = new (uint hash, uint offset, uint length)[count];
+            for (uint i = 0; i < count; i++)
+                entries[i] = (br.ReadUInt32(), br.ReadUInt32(), br.ReadUInt32());
+
+            uint stringsSize = br.ReadUInt32();
+            long stringsStart = br.BaseStream.Position;
+            foreach (var e in entries)
+            {
+                br.BaseStream.Position = stringsStart + e.offset;
+                var bytes = br.ReadBytes((int)e.length);
+                result[e.hash] = System.Text.Encoding.GetEncoding("ISO-8859-1").GetString(bytes);
+            }
+            return result;
+        }
+
+        // =================== CHUNK LOADING ===================
+
+        private static List<TerrainChunk> LoadAllChunks(
+            string spaceDir, UniversalTerrain ut)
+        {
+            var chunks = new List<TerrainChunk>();
+
+            if (!Directory.Exists(spaceDir))
+            {
+                WoTLogger.Error($"spaceDir does not exist: {spaceDir}");
+                return chunks;
+            }
+
+            // Diagnostic: dump the contents of spaceDir so we know what's there.
+            WoTLogger.Info($"=== Contents of {spaceDir} (first 40 files) ===");
+            try
+            {
+                var allFiles = Directory.GetFiles(spaceDir, "*", SearchOption.AllDirectories);
+                WoTLogger.Info($"Total files: {allFiles.Length}");
+                for (int i = 0; i < Math.Min(40, allFiles.Length); i++)
+                {
+                    string rel = allFiles[i].Substring(spaceDir.Length + 1).Replace('\\', '/');
+                    long size = new FileInfo(allFiles[i]).Length;
+                    WoTLogger.Info($"  [{size,8} B] {rel}");
+                }
+                if (allFiles.Length > 40)
+                    WoTLogger.Info($"  ... and {allFiles.Length - 40} more");
+
+                // Summary of file extensions present - this is the single most useful
+                // line for diagnosing "No terrain chunks found".
+                var extCounts = allFiles
+                    .GroupBy(f =>
+                    {
+                        string n = Path.GetFileName(f);
+                        int firstDot = n.IndexOf('.');
+                        return firstDot >= 0 ? n.Substring(firstDot).ToLowerInvariant() : "(no ext)";
+                    })
+                    .OrderByDescending(g => g.Count())
+                    .Select(g => $"{g.Key} x{g.Count()}");
+                WoTLogger.Info($"Extension histogram: {string.Join(", ", extCounts)}");
+            }
+            catch (Exception e)
+            {
+                WoTLogger.Warn($"Could not list spaceDir contents: {e.Message}");
+            }
+
+            // Find all cdata files in the extracted space directory.
+            // Files can be:
+            //   - XXXXXXXX.cdata          (old format, unprocessed)
+            //   - XXXXXXXXo.cdata_processed (new format, processed/optimized)
+            //   - XXXXXXXX.cdata_processed (also seen)
+            // Simi4 uses glob('*.cdata') which catches all three.
+            var cdataPaths = Directory.GetFiles(spaceDir, "*.cdata*");
+            // Filter to actual cdata files (not just any *.cdata* prefix)
+            cdataPaths = cdataPaths.Where(p => {
+                string n = Path.GetFileName(p).ToLowerInvariant();
+                return n.EndsWith(".cdata") || n.EndsWith(".cdata_processed");
+            }).ToArray();
+            WoTLogger.Info($"Found {cdataPaths.Length} .cdata/.cdata_processed files in {spaceDir}");
+            if (cdataPaths.Length == 0)
+            {
+                cdataPaths = Directory.GetFiles(spaceDir, "*.cdata*", SearchOption.AllDirectories);
+                cdataPaths = cdataPaths.Where(p => {
+                    string n = Path.GetFileName(p).ToLowerInvariant();
+                    return n.EndsWith(".cdata") || n.EndsWith(".cdata_processed");
+                }).ToArray();
+                WoTLogger.Info($"Recursive search: {cdataPaths.Length} .cdata files");
+
+                // Last resort: find any file matching XXXXYYY pattern (with optional
+                // 'o' suffix and optional extension).
+                if (cdataPaths.Length == 0)
+                {
+                    WoTLogger.Info("Falling back to hex-name pattern search...");
+                    var allFiles = Directory.GetFiles(spaceDir, "*", SearchOption.AllDirectories);
+                    var hexFiles = new List<string>();
+                    foreach (var f in allFiles)
+                    {
+                        string baseN = Path.GetFileNameWithoutExtension(f);
+                        // Strip optional trailing 'o' (e.g. "00000000o" -> "00000000")
+                        if (baseN.EndsWith("o")) baseN = baseN.Substring(0, baseN.Length - 1);
+                        if (baseN.Length != 8) continue;
+                        bool isHex = true;
+                        for (int i = 0; i < 8; i++)
+                        {
+                            char c = baseN[i];
+                            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                            { isHex = false; break; }
+                        }
+                        if (isHex) hexFiles.Add(f);
+                    }
+                    cdataPaths = hexFiles.ToArray();
+                    WoTLogger.Info($"Hex-name search: {cdataPaths.Length} files matching XXXXYYYY[o] pattern");
+                }
+            }
+
+            // Sort for deterministic processing
+            Array.Sort(cdataPaths, StringComparer.OrdinalIgnoreCase);
+
+            // Discover bounds from chunk names if not set
+            if (ut.MinX == ut.MaxX && ut.MinY == ut.MaxY && cdataPaths.Length > 0)
+            {
+                int minX = int.MaxValue, maxX = int.MinValue;
+                int minY = int.MaxValue, maxY = int.MinValue;
+                foreach (var path in cdataPaths)
+                {
+                    ParseChunkName(Path.GetFileName(path), out int hexX, out int hexY);
+                    if (hexX < minX) minX = hexX;
+                    if (hexX > maxX) maxX = hexX;
+                    if (hexY < minY) minY = hexY;
+                    if (hexY > maxY) maxY = hexY;
+                }
+                ut.MinX = minX; ut.MaxX = maxX; ut.MinY = minY; ut.MaxY = maxY;
+                WoTLogger.Info($"Discovered terrain bounds from cdata: x[{minX}..{maxX}] y[{minY}..{maxY}]");
+            }
+
+            int skippedTooSmall = 0, skippedNull = 0, skippedException = 0;
+            foreach (var path in cdataPaths)
+            {
+                string baseName = Path.GetFileName(path);
+                ParseChunkName(baseName, out int hexX, out int hexY);
+                Vector2 chunkPos = new Vector2(hexX * ut.ChunkSize, hexY * ut.ChunkSize);
+
+                try
+                {
+                    byte[] data = File.ReadAllBytes(path);
+                    if (data.Length < 4) { skippedTooSmall++; continue; }
+
+                    var chunk = TerrainChunkDecoder.Decode(data, baseName, chunkPos);
+                    if (chunk != null)
+                        chunks.Add(chunk);
+                    else
+                        skippedNull++;
+                }
+                catch (Exception e)
+                {
+                    skippedException++;
+                    WoTLogger.Warn($"Failed to decode chunk {baseName}: {e.Message}");
+                }
+            }
+            WoTLogger.Info($"Loaded {chunks.Count}/{cdataPaths.Length} terrain chunks " +
+                           $"(skipped: {skippedNull} null, {skippedException} errors, {skippedTooSmall} too small)");
+            if (chunks.Count == 0 && cdataPaths.Length > 0)
+            {
+                WoTLogger.Error(
+                    "Found .cdata files but decoded 0 chunks. The most common reason on modern " +
+                    "clients is that the chunks are NOT plain ZIP archives (processed/packed format). " +
+                    "Check the 'Decoding chunk ... isZip=' lines above.");
+            }
+            return chunks;
+        }
+
+        // =================== STATIC OBJECTS ===================
+
+        private static void LoadStaticObjects(
+            string spaceDir, string outputPath, WoTPackageManager pkgMgr,
+            GameObject root, ImportResult result)
+        {
+            string spaceBinPath = Path.Combine(spaceDir, "space.bin");
+            if (!File.Exists(spaceBinPath))
+            {
+                WoTLogger.Warn("space.bin not found; skipping static objects (old-format spaces not supported yet)");
+                return;
+            }
+
+            byte[] bin = File.ReadAllBytes(spaceBinPath);
+            var space = Package.CompiledSpace.Parse(bin);
+            if (space.Models.Count == 0)
+            {
+                WoTLogger.Warn("CompiledSpace produced 0 model instances");
+                return;
+            }
+
+            // Group instances by prims file so we decode each mesh only once.
+            var byPrims = new Dictionary<string, List<Package.CompiledSpace.ModelInstance>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var m in space.Models)
+            {
+                if (string.IsNullOrEmpty(m.PrimsName)) continue;
+                if (!byPrims.TryGetValue(m.PrimsName, out var list))
+                    byPrims[m.PrimsName] = list = new List<Package.CompiledSpace.ModelInstance>();
+                list.Add(m);
+            }
+
+            var objectsRoot = new GameObject("StaticObjects");
+            objectsRoot.transform.SetParent(root.transform, false);
+
+            int built = 0, failed = 0, instances = 0;
+            foreach (var kv in byPrims)
+            {
+                string primsName = kv.Key;
+                var insts = kv.Value;
+
+                // Use the first instance's verts/prims data-section names + diffuse.
+                var first = insts[0];
+                var transforms = new List<Mesh.ObjectBuilder.ObjectTransform>();
+                foreach (var m in insts)
+                {
+                    var t = m.Transform;
+                    transforms.Add(new Mesh.ObjectBuilder.ObjectTransform
+                    {
+                        Row0 = new Vector4(t[0], t[1], t[2], t[3]),
+                        Row1 = new Vector4(t[4], t[5], t[6], t[7]),
+                        Row2 = new Vector4(t[8], t[9], t[10], t[11]),
+                        Row3 = new Vector4(t[12], t[13], t[14], t[15]),
+                    });
+                }
+
+                var texPaths = new List<string>();
+                if (!string.IsNullOrEmpty(first.DiffuseTexture))
+                    texPaths.Add(first.DiffuseTexture);
+
+                try
+                {
+                    var br = Mesh.ObjectBuilder.Build(outputPath, primsName,
+                        first.VertsDataName, transforms, texPaths, pkgMgr);
+                    if (br.Root != null)
+                    {
+                        br.Root.transform.SetParent(objectsRoot.transform, false);
+                        built++;
+                        instances += insts.Count;
+                    }
+                    else
+                    {
+                        failed++;
+                        if (br.Warnings.Count > 0) WoTLogger.Warn(br.Warnings[0]);
+                    }
+                }
+                catch (Exception e)
+                {
+                    failed++;
+                    WoTLogger.Warn($"Object build failed for {primsName}: {e.Message}");
+                }
+            }
+
+            WoTLogger.Info($"Static objects: {built} models built ({instances} instances), {failed} failed, " +
+                           $"{byPrims.Count} unique prims");
+            result.Warnings.Add($"Objects: {built} models / {instances} instances");
+        }
+
+        private static void ParseChunkName(string name, out int hexX, out int hexY)
+        {
+            // A chunk file is named like "XXXXYYYY.cdata" / "XXXXYYYYo.cdata_processed".
+            // We only care about the first 8 hex chars (matches Blender: chunk_name = item.name[:8]).
+            // Strip every extension first (the file may have a double extension).
+            string baseName = name;
+            int dot = baseName.IndexOf('.');
+            if (dot >= 0) baseName = baseName.Substring(0, dot);
+
+            hexX = 0; hexY = 0;
+            if (baseName.Length < 8) return;
+            try
+            {
+                // NOTE: Substring's 2nd arg is LENGTH, not end index. Both halves are 4 chars.
+                hexX = unchecked((short)Convert.ToInt32(baseName.Substring(0, 4), 16));
+                hexY = unchecked((short)Convert.ToInt32(baseName.Substring(4, 4), 16));
+            }
+            catch (Exception e)
+            {
+                WoTLogger.Warn($"ParseChunkName failed for '{name}' (base '{baseName}'): {e.Message}");
+            }
+        }
+    }
+}
