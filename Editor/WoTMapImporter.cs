@@ -35,6 +35,7 @@ namespace WoTMapImporter.Editor
 
         public class ImportSettings
         {
+            public bool LoadTerrain = true;
             public bool LoadObjects = true;
             public bool LoadNormals = true;
             public bool LoadWetness = false;
@@ -95,39 +96,48 @@ namespace WoTMapImporter.Editor
                 progress?.Invoke(0.15f, "Loading space settings...");
                 UniversalTerrain universalTerrain = LoadTerrainMetadata(spaceDir, pkgMgr, geometry);
 
-                progress?.Invoke(0.3f, "Loading cdata chunks...");
-                var chunks = LoadAllChunks(spaceDir, universalTerrain);
-
-                if (chunks.Count == 0)
-                {
-                    result.Errors.Add("No terrain chunks found at " + spaceDir);
-                    return result;
-                }
-
                 var folder = $"{outputFolder}/{mapInfo.Name}";
-
-                progress?.Invoke(0.7f, settings.TerrainMode == TerrainImportMode.MeshChunks
-                    ? "Building WoT mesh terrain chunks..."
-                    : "Building Unity Terrain...");
+                EnsureAssetFolder(folder);
 
                 GameObject terrainObject = null;
-                if (settings.TerrainMode == TerrainImportMode.MeshChunks)
+                if (settings.LoadTerrain)
                 {
-                    var meshResult = TerrainMeshBuilder.Build(folder, mapInfo, universalTerrain, chunks, pkgMgr,
-                                                              settings.LoadWetness);
-                    terrainObject = meshResult.TerrainObject;
-                    result.Warnings.AddRange(meshResult.Warnings);
+                    progress?.Invoke(0.3f, "Loading cdata chunks...");
+                    var chunks = LoadAllChunks(spaceDir, universalTerrain);
+
+                    if (chunks.Count == 0)
+                    {
+                        result.Errors.Add("No terrain chunks found at " + spaceDir);
+                        return result;
+                    }
+
+                    progress?.Invoke(0.7f, settings.TerrainMode == TerrainImportMode.MeshChunks
+                        ? "Building WoT mesh terrain chunks..."
+                        : "Building Unity Terrain...");
+
+                    if (settings.TerrainMode == TerrainImportMode.MeshChunks)
+                    {
+                        var meshResult = TerrainMeshBuilder.Build(folder, mapInfo, universalTerrain, chunks, pkgMgr,
+                                                                  settings.LoadWetness);
+                        terrainObject = meshResult.TerrainObject;
+                        result.Warnings.AddRange(meshResult.Warnings);
+                    }
+                    else
+                    {
+                        var buildResult = TerrainBuilder.Build(folder, mapInfo, universalTerrain, chunks, pkgMgr,
+                                                               settings.MaxHeightmapResolution);
+                        terrainObject = buildResult.TerrainObject;
+                        result.TerrainData = buildResult.TerrainData;
+                        result.Warnings.AddRange(buildResult.Warnings);
+                    }
                 }
                 else
                 {
-                    var buildResult = TerrainBuilder.Build(folder, mapInfo, universalTerrain, chunks, pkgMgr,
-                                                           settings.MaxHeightmapResolution);
-                    terrainObject = buildResult.TerrainObject;
-                    result.TerrainData = buildResult.TerrainData;
-                    result.Warnings.AddRange(buildResult.Warnings);
+                    progress?.Invoke(0.7f, "Terrain import disabled...");
+                    result.Warnings.Add("Terrain import disabled");
                 }
 
-                progress?.Invoke(0.9f, "Creating root object...");
+                progress?.Invoke(settings.LoadObjects ? 0.9f : 0.95f, "Creating root object...");
                 var root = new GameObject($"WoTMap_{mapInfo.Name}");
                 if (terrainObject != null)
                     terrainObject.transform.SetParent(root.transform, false);
@@ -547,76 +557,48 @@ namespace WoTMapImporter.Editor
 
             byte[] bin = File.ReadAllBytes(spaceBinPath);
             var space = Package.CompiledSpace.Parse(bin);
-            if (space.Models.Count == 0)
+            if (space.Placements.Count == 0)
             {
-                WoTLogger.Warn("CompiledSpace produced 0 model instances");
+                WoTLogger.Warn("CompiledSpace produced 0 visible model placements");
                 return;
             }
 
-            // Group instances by prims file so we decode each mesh only once.
-            var byPrims = new Dictionary<string, List<Package.CompiledSpace.ModelInstance>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var m in space.Models)
+            var objectBuild = Mesh.ObjectBuilder.Build(outputPath, space, pkgMgr);
+            if (objectBuild.Root != null)
             {
-                if (string.IsNullOrEmpty(m.PrimsName)) continue;
-                if (!byPrims.TryGetValue(m.PrimsName, out var list))
-                    byPrims[m.PrimsName] = list = new List<Package.CompiledSpace.ModelInstance>();
-                list.Add(m);
+                objectBuild.Root.transform.SetParent(root.transform, false);
+                ApplyRequestedObjectsRootTransform(objectBuild.Root.transform);
             }
 
-            var objectsRoot = new GameObject("StaticObjects");
-            objectsRoot.transform.SetParent(root.transform, false);
-
-            int built = 0, failed = 0, instances = 0;
-            foreach (var kv in byPrims)
+            foreach (var w in objectBuild.Warnings)
             {
-                string primsName = kv.Key;
-                var insts = kv.Value;
-
-                // Use the first instance's verts/prims data-section names + diffuse.
-                var first = insts[0];
-                var transforms = new List<Mesh.ObjectBuilder.ObjectTransform>();
-                foreach (var m in insts)
-                {
-                    var t = m.Transform;
-                    transforms.Add(new Mesh.ObjectBuilder.ObjectTransform
-                    {
-                        Row0 = new Vector4(t[0], t[1], t[2], t[3]),
-                        Row1 = new Vector4(t[4], t[5], t[6], t[7]),
-                        Row2 = new Vector4(t[8], t[9], t[10], t[11]),
-                        Row3 = new Vector4(t[12], t[13], t[14], t[15]),
-                    });
-                }
-
-                var texPaths = new List<string>();
-                if (!string.IsNullOrEmpty(first.DiffuseTexture))
-                    texPaths.Add(first.DiffuseTexture);
-
-                try
-                {
-                    var br = Mesh.ObjectBuilder.Build(outputPath, primsName,
-                        first.VertsDataName, transforms, texPaths, pkgMgr);
-                    if (br.Root != null)
-                    {
-                        br.Root.transform.SetParent(objectsRoot.transform, false);
-                        built++;
-                        instances += insts.Count;
-                    }
-                    else
-                    {
-                        failed++;
-                        if (br.Warnings.Count > 0) WoTLogger.Warn(br.Warnings[0]);
-                    }
-                }
-                catch (Exception e)
-                {
-                    failed++;
-                    WoTLogger.Warn($"Object build failed for {primsName}: {e.Message}");
-                }
+                WoTLogger.Info(w);
+                result.Warnings.Add(w);
             }
 
-            WoTLogger.Info($"Static objects: {built} models built ({instances} instances), {failed} failed, " +
-                           $"{byPrims.Count} unique prims");
-            result.Warnings.Add($"Objects: {built} models / {instances} instances");
+            WoTLogger.Info($"Static objects: {space.Placements.Count} placements, {space.Models.Count} LOD0 render instances (legacy count)");
+        }
+
+        private static void ApplyRequestedObjectsRootTransform(Transform objectsRoot)
+        {
+            if (objectsRoot == null) return;
+
+            // User-facing coordinate adjustment for static objects only.
+            // Terrain stays untouched; all imported objects, destructible hierarchy
+            // and trigger colliders are under StaticObjects with this transform.
+            objectsRoot.localRotation = Quaternion.Euler(-90f, 180f, 0f);
+            objectsRoot.localScale = new Vector3(-1f, 1f, 1f);
+        }
+
+        private static void EnsureAssetFolder(string folderPath)
+        {
+            folderPath = folderPath.Replace('\\', '/');
+            if (string.IsNullOrEmpty(folderPath) || AssetDatabase.IsValidFolder(folderPath)) return;
+
+            string parent = Path.GetDirectoryName(folderPath)?.Replace('\\', '/') ?? "Assets";
+            string leaf = Path.GetFileName(folderPath);
+            if (!AssetDatabase.IsValidFolder(parent)) EnsureAssetFolder(parent);
+            if (!AssetDatabase.IsValidFolder(folderPath)) AssetDatabase.CreateFolder(parent, leaf);
         }
 
         private static void ParseChunkName(string name, out int hexX, out int hexY)

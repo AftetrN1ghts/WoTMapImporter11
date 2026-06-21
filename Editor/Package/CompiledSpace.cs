@@ -6,34 +6,169 @@ using WoTMapImporter.Editor.Utils;
 namespace WoTMapImporter.Editor.Package
 {
     /// <summary>
-    /// Minimal parser for WoT's compiled "space.bin" (CompiledSpace) format.
-    /// Ported from Simi4/WoT-Blender-Addons map_viewer/compiled_space, but only
-    /// the parts needed to place static models:
-    ///   - BWTB   : root table (section directory)
-    ///   - BWST   : string table (fnv hash -> string)
-    ///   - BSMI   : static model instances (transforms + model ids)
-    ///   - BSMO   : static models (lod -> renders -> prims/verts names)
-    ///   - BSMA   : static materials (-> diffuse texture name)
+    /// Parser for WoT's compiled "space.bin" static model data.
     ///
-    /// Layout primitives (see _base_json_section.py):
-    ///   list  field: [u32 elemSize][u32 count][count * elemSize bytes]
-    ///   dict  field: [u32 elemSize][elemSize bytes]
+    /// This follows the reference Blender addon's universal_space.py more closely
+    /// than the old minimal port:
+    ///   - BSMI visibility masks are respected;
+    ///   - BSMO render sets are grouped per placed model, not just per primitives file;
+    ///   - every LOD in models_loddings/lod_renders is kept;
+    ///   - BSMA material fx names and all material properties are resolved via BWST;
+    ///   - destructible/fragile entries expose their destroyed_model_index.
     /// </summary>
     public sealed class CompiledSpace
     {
+        public const uint CaptureTheFlagVisibility = 1u;
+
+        // Legacy flat render instance kept for compatibility with older callers.
         public class ModelInstance
         {
-            public string PrimsName;     // e.g. "content/.../foo.primitives_processed"
-            public string VertsDataName; // section name inside the primitives file
+            public string PrimsName;
+            public string VertsDataName;
             public string PrimsDataName;
-            public int PrimitiveGroup;   // primitiveGroup index for this render set
+            public int PrimitiveGroup;
             public string DiffuseTexture;
-            public float[] Transform;    // 16 floats, row-major (WoT)
+            public float[] Transform;
+        }
+
+        public sealed class MaterialProperty
+        {
+            public string Name;
+            public uint ValueType;
+            public uint RawValue;
+            public string StringValue;
+            public float[] VectorValue;
+
+            public override string ToString()
+            {
+                if (StringValue != null) return StringValue;
+                if (VectorValue != null) return string.Join(",", VectorValue);
+                return RawValue.ToString();
+            }
+        }
+
+        public sealed class RenderMesh
+        {
+            public int RenderSetId;
+            public int PrimitiveGroup;
+            public int MaterialIndex;
+            public string PrimsName;
+            public string VertsDataName;
+            public string PrimsDataName;
+            public string FxName;
+            public string Identifier;
+            public bool IsDestroyedMaterial;
+            public Dictionary<string, MaterialProperty> Props = new Dictionary<string, MaterialProperty>(StringComparer.OrdinalIgnoreCase);
+
+            public string DiffuseTexture => GetString("diffuseMap");
+
+            public string GetString(string name)
+            {
+                return Props.TryGetValue(name, out var p) ? p.StringValue : null;
+            }
+
+            public float[] GetVector(string name)
+            {
+                return Props.TryGetValue(name, out var p) ? p.VectorValue : null;
+            }
+        }
+
+        public sealed class ModelLod
+        {
+            public int LodIndex;
+            public float Distance;
+            public List<RenderMesh> Meshes = new List<RenderMesh>();
+        }
+
+        public sealed class ModelPlacement
+        {
+            public int InstanceIndex;
+            public int ModelId;
+            public int DestroyedModelId = -1;
+            public float[] Transform;
+            public List<ModelLod> Lods = new List<ModelLod>();
+            public List<ModelLod> DestroyedLods = new List<ModelLod>();
         }
 
         public readonly List<ModelInstance> Models = new List<ModelInstance>();
+        public readonly List<ModelPlacement> Placements = new List<ModelPlacement>();
 
-        private struct Row { public string Header; public uint Position; public uint Length; }
+        private struct Row
+        {
+            public string Header;
+            public uint Int1;
+            public uint Position;
+            public uint Length;
+            public uint RowsNum;
+        }
+
+        private struct RawList
+        {
+            public int ElemSize;
+            public int Count;
+            public byte[][] Items;
+        }
+
+        private sealed class BsmiData
+        {
+            public float[][] Transforms = Array.Empty<float[]>();
+            public uint[] ModelIds = Array.Empty<uint>();
+            public uint[] VisibilityMasks = Array.Empty<uint>();
+        }
+
+        private sealed class RenderItem
+        {
+            public uint MaterialIndex;
+            public uint PrimitiveIndex;
+            public uint VertsNameFnv;
+            public uint PrimsNameFnv;
+        }
+
+        private sealed class ModelInfoItem
+        {
+            public uint Type;
+            public uint InfoIndex;
+        }
+
+        private sealed class FragileInfoItem
+        {
+            public uint DestroyedModelIndex;
+            public uint EntryType;
+        }
+
+        private sealed class BsmoData
+        {
+            public (uint begin, uint end)[] ModelsLoddings = Array.Empty<(uint, uint)>();
+            public (uint begin, uint end)[] LodRenders = Array.Empty<(uint, uint)>();
+            public float[] LodDistances = Array.Empty<float>();
+            public RenderItem[] Renders = Array.Empty<RenderItem>();
+            public ModelInfoItem[] ModelInfos = Array.Empty<ModelInfoItem>();
+            public FragileInfoItem[] FragileInfos = Array.Empty<FragileInfoItem>();
+        }
+
+        private sealed class MaterialInfo
+        {
+            public int KeyFx;
+            public int KeyFrom;
+            public int KeyTo;
+            public uint IdentifierFnv;
+            public uint Identifier2Fnv;
+        }
+
+        private sealed class PropInfo
+        {
+            public uint PropFnv;
+            public uint ValueType;
+            public uint Value;
+        }
+
+        private sealed class BsmaData
+        {
+            public MaterialInfo[] Materials = Array.Empty<MaterialInfo>();
+            public uint[] Fx = Array.Empty<uint>();
+            public PropInfo[] Props = Array.Empty<PropInfo>();
+            public float[][] Vectors = Array.Empty<float[]>();
+        }
 
         // ---- public entry ----
 
@@ -55,7 +190,6 @@ namespace WoTMapImporter.Editor.Package
 
             var rows = ReadBwtb(br);
 
-            // String table first (everything references it by fnv hash).
             var strings = new Dictionary<uint, string>();
             if (rows.TryGetValue("BWST", out var bwstRow))
                 strings = ReadBwst(br, bwstRow);
@@ -67,10 +201,18 @@ namespace WoTMapImporter.Editor.Package
                 return;
             }
 
-            var bsmi = ReadBsmi(br, bsmiRow);
             var bsmo = ReadBsmo(br, bsmoRow);
+            var bsmi = ReadBsmi(br, bsmiRow, bsmo.ModelsLoddings.Length);
             BsmaData bsma = rows.TryGetValue("BSMA", out var bsmaRow)
                 ? ReadBsma(br, bsmaRow) : new BsmaData();
+
+            // Some versions move visibility masks out of BSMI into BWSV.
+            if (rows.TryGetValue("BWSV", out var bwsvRow))
+            {
+                var masks = TryReadVisibilityMasks(br, bwsvRow, bsmi.Transforms.Length);
+                if (masks != null && masks.Length > 0)
+                    bsmi.VisibilityMasks = masks;
+            }
 
             BuildModels(strings, bsmi, bsmo, bsma);
         }
@@ -79,20 +221,11 @@ namespace WoTMapImporter.Editor.Package
 
         private static Dictionary<string, Row> ReadBwtb(BinaryReader br)
         {
-            // Root row: 4s + 5 u32 = 24 bytes.
             var root = ReadRow(br);
             if (root.Header != "BWTB") throw new Exception($"Not a compiled space (header={root.Header})");
-            // rows_num is the 6th field; ReadRow stored it in Length? No - re-read explicitly.
-            br.BaseStream.Position = 0;
-            string h = ReadHeader(br);
-            br.ReadUInt32();                 // int1
-            br.ReadUInt32();                 // position
-            br.ReadUInt32();                 // int3
-            br.ReadUInt32();                 // length
-            uint rowsNum = br.ReadUInt32();  // rows_num
 
             var map = new Dictionary<string, Row>();
-            for (uint i = 0; i < rowsNum; i++)
+            for (uint i = 0; i < root.RowsNum; i++)
             {
                 var r = ReadRow(br);
                 map[r.Header] = r;
@@ -103,12 +236,12 @@ namespace WoTMapImporter.Editor.Package
         private static Row ReadRow(BinaryReader br)
         {
             string header = ReadHeader(br);
-            br.ReadUInt32();                 // int1
+            uint int1 = br.ReadUInt32();
             uint position = br.ReadUInt32();
-            br.ReadUInt32();                 // int3
+            br.ReadUInt32(); // int3
             uint length = br.ReadUInt32();
-            br.ReadUInt32();                 // rows_num (unused for children)
-            return new Row { Header = header, Position = position, Length = length };
+            uint rowsNum = br.ReadUInt32();
+            return new Row { Header = header, Int1 = int1, Position = position, Length = length, RowsNum = rowsNum };
         }
 
         private static string ReadHeader(BinaryReader br)
@@ -125,14 +258,13 @@ namespace WoTMapImporter.Editor.Package
             if (row.Length == 0) return result;
             br.BaseStream.Position = row.Position;
 
-            // entries: [u32 size=12][u32 count][count * (hash, offset, length)]
             uint sz = br.ReadUInt32();
             uint cnt = br.ReadUInt32();
             var entries = new (uint hash, uint offset, uint length)[cnt];
             for (uint i = 0; i < cnt; i++)
                 entries[i] = (br.ReadUInt32(), br.ReadUInt32(), br.ReadUInt32());
 
-            uint stringsSize = br.ReadUInt32();
+            br.ReadUInt32(); // stringsSize
             long stringsStart = br.BaseStream.Position;
             foreach (var e in entries)
             {
@@ -143,193 +275,351 @@ namespace WoTMapImporter.Editor.Package
             return result;
         }
 
-        // =================== generic list/dict readers ===================
+        // =================== raw list helpers ===================
 
-        /// <summary>Reads a "list" field: [u32 elemSize][u32 count] then count*elemSize bytes.
-        /// Returns the raw element byte blocks.</summary>
-        private static byte[][] ReadListRaw(BinaryReader br, out int elemSize)
-        {
-            elemSize = (int)br.ReadUInt32();
-            int count = (int)br.ReadUInt32();
-            var arr = new byte[count][];
-            for (int i = 0; i < count; i++)
-                arr[i] = br.ReadBytes(elemSize);
-            return arr;
-        }
-
-        private static void SkipList(BinaryReader br)
+        private static RawList ReadRawList(BinaryReader br)
         {
             int elemSize = (int)br.ReadUInt32();
             int count = (int)br.ReadUInt32();
-            br.BaseStream.Position += (long)elemSize * count;
+            if (elemSize < 0 || count < 0 || count > 10_000_000)
+                throw new Exception($"Invalid list header elemSize={elemSize} count={count}");
+            var arr = new byte[count][];
+            for (int i = 0; i < count; i++)
+                arr[i] = br.ReadBytes(elemSize);
+            return new RawList { ElemSize = elemSize, Count = count, Items = arr };
+        }
+
+        private static List<RawList> ReadAllLists(BinaryReader br, Row row)
+        {
+            var lists = new List<RawList>();
+            long end = row.Position + row.Length;
+            br.BaseStream.Position = row.Position;
+            while (br.BaseStream.Position + 8 <= end)
+            {
+                long before = br.BaseStream.Position;
+                try
+                {
+                    var list = ReadRawList(br);
+                    if (br.BaseStream.Position > end)
+                    {
+                        br.BaseStream.Position = before;
+                        break;
+                    }
+                    lists.Add(list);
+                }
+                catch
+                {
+                    br.BaseStream.Position = before;
+                    break;
+                }
+            }
+            return lists;
+        }
+
+        private static uint FirstUInt(byte[] b, int offset = 0)
+        {
+            return b != null && b.Length >= offset + 4 ? BitConverter.ToUInt32(b, offset) : 0u;
+        }
+
+        private static int FirstInt(byte[] b, int offset = 0)
+        {
+            return b != null && b.Length >= offset + 4 ? BitConverter.ToInt32(b, offset) : 0;
+        }
+
+        private static float FirstFloat(byte[] b, int offset = 0)
+        {
+            return b != null && b.Length >= offset + 4 ? BitConverter.ToSingle(b, offset) : 0f;
         }
 
         // =================== BSMI (instances) ===================
 
-        private class BsmiData
-        {
-            public float[][] Transforms;     // each 16 floats
-            public uint[] ModelIds;          // model index per instance
-            public uint[] VisibilityMasks;
-        }
-
-        private static BsmiData ReadBsmi(BinaryReader br, Row row)
+        private static BsmiData ReadBsmi(BinaryReader br, Row row, int modelCount)
         {
             var d = new BsmiData();
             br.BaseStream.Position = row.Position;
 
-            // field 0: transforms  '<16f'
+            var transformsRaw = ReadRawList(br);
+            d.Transforms = new float[transformsRaw.Count][];
+            for (int i = 0; i < transformsRaw.Count; i++)
             {
-                var raw = ReadListRaw(br, out int es);
-                d.Transforms = new float[raw.Length][];
-                for (int i = 0; i < raw.Length; i++)
+                var t = new float[16];
+                if (transformsRaw.Items[i].Length >= 16 * 4)
+                    Buffer.BlockCopy(transformsRaw.Items[i], 0, t, 0, 16 * 4);
+                d.Transforms[i] = t;
+            }
+
+            // chunk_models, not needed for geometry import
+            if (br.BaseStream.Position + 8 <= row.Position + row.Length)
+                ReadRawList(br);
+
+            RawList field2 = default;
+            RawList field3 = default;
+            bool hasField2 = false, hasField3 = false;
+            if (br.BaseStream.Position + 8 <= row.Position + row.Length)
+            { field2 = ReadRawList(br); hasField2 = true; }
+            if (br.BaseStream.Position + 8 <= row.Position + row.Length)
+            { field3 = ReadRawList(br); hasField3 = true; }
+
+            uint[] f2 = hasField2 ? FirstUInts(field2) : Array.Empty<uint>();
+            uint[] f3 = hasField3 ? FirstUInts(field3) : Array.Empty<uint>();
+
+            bool f2LooksModel = LooksLikeModelIds(f2, modelCount, d.Transforms.Length);
+            bool f3LooksModel = LooksLikeModelIds(f3, modelCount, d.Transforms.Length);
+
+            // Version layout:
+            // 0.9.12/0.9.16: field2=bsmo_models_id, field3=visibility/animation;
+            // 0.9.20..1.2 : field2=visibility, field3=bsmo_models_id;
+            // 1.5+        : field2=visibility, field3=<model_id,count>.
+            bool useField3AsModels = false;
+            if (hasField3 && field3.ElemSize == 8 && f3LooksModel)
+                useField3AsModels = true;
+            else if (row.Int1 >= 2 && f3LooksModel)
+                useField3AsModels = true;
+            else if (!f2LooksModel && f3LooksModel)
+                useField3AsModels = true;
+
+            if (useField3AsModels)
+            {
+                d.ModelIds = f3;
+                d.VisibilityMasks = f2.Length == d.Transforms.Length ? f2 : AllVisible(d.Transforms.Length);
+            }
+            else
+            {
+                d.ModelIds = f2LooksModel ? f2 : f3;
+                if (hasField3 && f3.Length == d.Transforms.Length && !ReferenceEquals(d.ModelIds, f3) && row.Int1 != 1)
+                    d.VisibilityMasks = f3;
+                else
+                    // In 0.9.12 field3 is animations_id, not visibility; importing all
+                    // is safer than accidentally hiding animated objects.
+                    d.VisibilityMasks = AllVisible(d.Transforms.Length);
+            }
+
+            if (d.ModelIds.Length != d.Transforms.Length)
+            {
+                int n = Math.Min(d.ModelIds.Length, d.Transforms.Length);
+                Array.Resize(ref d.ModelIds, n);
+                Array.Resize(ref d.Transforms, n);
+                Array.Resize(ref d.VisibilityMasks, n);
+            }
+
+            return d;
+        }
+
+        private static uint[] FirstUInts(RawList list)
+        {
+            var arr = new uint[list.Count];
+            for (int i = 0; i < list.Count; i++)
+                arr[i] = FirstUInt(list.Items[i], 0);
+            return arr;
+        }
+
+        private static bool LooksLikeModelIds(uint[] vals, int modelCount, int instanceCount)
+        {
+            if (vals == null || vals.Length == 0 || vals.Length != instanceCount || modelCount <= 0)
+                return false;
+            int ok = 0;
+            foreach (var v in vals)
+            {
+                if (v < modelCount) ok++;
+                else if (v == uint.MaxValue) return false;
+            }
+            return ok >= Math.Max(1, vals.Length * 3 / 4);
+        }
+
+        private static uint[] AllVisible(int n)
+        {
+            var a = new uint[n];
+            for (int i = 0; i < n; i++) a[i] = 0xffffffffu;
+            return a;
+        }
+
+        private static uint[] TryReadVisibilityMasks(BinaryReader br, Row row, int expectedCount)
+        {
+            try
+            {
+                var lists = ReadAllLists(br, row);
+                foreach (var l in lists)
                 {
-                    var t = new float[16];
-                    Buffer.BlockCopy(raw[i], 0, t, 0, 16 * 4);
-                    d.Transforms[i] = t;
+                    if (l.ElemSize == 4 && (expectedCount <= 0 || l.Count == expectedCount))
+                        return FirstUInts(l);
                 }
             }
-            // field 1: chunk_models (8 bytes each) - skip
-            SkipList(br);
-            // field 2: visibility_masks '<I'
+            catch (Exception e)
             {
-                var raw = ReadListRaw(br, out int es);
-                d.VisibilityMasks = new uint[raw.Length];
-                for (int i = 0; i < raw.Length; i++)
-                    d.VisibilityMasks[i] = BitConverter.ToUInt32(raw[i], 0);
+                WoTLogger.Warn($"BWSV visibility parse failed: {e.Message}");
             }
-            // field 3: bsmo_models_id '<2I' (model_id, count) - we take element 0
-            {
-                var raw = ReadListRaw(br, out int es);
-                d.ModelIds = new uint[raw.Length];
-                for (int i = 0; i < raw.Length; i++)
-                    d.ModelIds[i] = BitConverter.ToUInt32(raw[i], 0);
-            }
-            // Remaining fields are not needed.
-            return d;
+            return null;
         }
 
         // =================== BSMO (models) ===================
 
-        private class RenderItem
-        {
-            public uint MaterialIndex;
-            public uint PrimitiveIndex;
-            public uint VertsNameFnv;
-            public uint PrimsNameFnv;
-        }
-
-        private class BsmoData
-        {
-            public (uint begin, uint end)[] ModelsLoddings;     // lod_begin..lod_end
-            public (uint begin, uint end)[] LodRenders;         // render_set_begin..end
-            public RenderItem[] Renders;
-        }
-
         private static BsmoData ReadBsmo(BinaryReader br, Row row)
         {
             var d = new BsmoData();
-            br.BaseStream.Position = row.Position;
+            var lists = ReadAllLists(br, row);
+            if (lists.Count == 0) return d;
 
-            // 0 models_loddings (8 bytes: lod_begin,lod_end)
+            d.ModelsLoddings = new (uint, uint)[lists[0].Count];
+            for (int i = 0; i < lists[0].Count; i++)
+                d.ModelsLoddings[i] = (FirstUInt(lists[0].Items[i], 0), FirstUInt(lists[0].Items[i], 4));
+
+            int renderIdx = -1;
+            for (int i = 1; i < lists.Count; i++)
             {
-                var raw = ReadListRaw(br, out int es);
-                d.ModelsLoddings = new (uint, uint)[raw.Length];
-                for (int i = 0; i < raw.Length; i++)
-                    d.ModelsLoddings[i] = (BitConverter.ToUInt32(raw[i], 0), BitConverter.ToUInt32(raw[i], 4));
-            }
-            SkipList(br); // 1  '<I'
-            SkipList(br); // 2  models_colliders (36)
-            SkipList(br); // 3  bsp_material_kinds (8)
-            SkipList(br); // 4  models_visibility_bounds (24)
-            SkipList(br); // 5  model_info_items
-            SkipList(br); // 6  model_sound_items '<I'
-            SkipList(br); // 7  lod_loddings '<f'
-            // 8 lod_renders (8 bytes: render_set_begin, render_set_end)
-            {
-                var raw = ReadListRaw(br, out int es);
-                d.LodRenders = new (uint, uint)[raw.Length];
-                for (int i = 0; i < raw.Length; i++)
-                    d.LodRenders[i] = (BitConverter.ToUInt32(raw[i], 0), BitConverter.ToUInt32(raw[i], 4));
-            }
-            // 9 renders (28 bytes: node_begin,node_end,material_index,primitive_index,verts_fnv,prims_fnv,flags)
-            {
-                var raw = ReadListRaw(br, out int es);
-                d.Renders = new RenderItem[raw.Length];
-                for (int i = 0; i < raw.Length; i++)
+                if (lists[i].ElemSize == 28)
                 {
-                    var b = raw[i];
-                    d.Renders[i] = new RenderItem
-                    {
-                        MaterialIndex = BitConverter.ToUInt32(b, 8),
-                        PrimitiveIndex = BitConverter.ToUInt32(b, 12),
-                        VertsNameFnv = BitConverter.ToUInt32(b, 16),
-                        PrimsNameFnv = BitConverter.ToUInt32(b, 20),
-                    };
+                    renderIdx = i;
+                    break;
                 }
             }
-            // Remaining fields unused.
+            if (renderIdx < 1)
+            {
+                WoTLogger.Warn("BSMO: renders list (elemSize=28) not found");
+                return d;
+            }
+
+            var lodRenderList = lists[renderIdx - 1];
+            d.LodRenders = new (uint, uint)[lodRenderList.Count];
+            for (int i = 0; i < lodRenderList.Count; i++)
+                d.LodRenders[i] = (FirstUInt(lodRenderList.Items[i], 0), FirstUInt(lodRenderList.Items[i], 4));
+
+            if (renderIdx >= 2 && lists[renderIdx - 2].ElemSize == 4)
+            {
+                var lodDist = lists[renderIdx - 2];
+                d.LodDistances = new float[lodDist.Count];
+                for (int i = 0; i < lodDist.Count; i++)
+                    d.LodDistances[i] = FirstFloat(lodDist.Items[i]);
+            }
+
+            var rendersRaw = lists[renderIdx];
+            d.Renders = new RenderItem[rendersRaw.Count];
+            for (int i = 0; i < rendersRaw.Count; i++)
+            {
+                var b = rendersRaw.Items[i];
+                d.Renders[i] = new RenderItem
+                {
+                    MaterialIndex = FirstUInt(b, 8),
+                    PrimitiveIndex = FirstUInt(b, 12),
+                    VertsNameFnv = FirstUInt(b, 16),
+                    PrimsNameFnv = FirstUInt(b, 20),
+                };
+            }
+
+            int modelInfoIdx = renderIdx - 4;
+            if (modelInfoIdx >= 0 && modelInfoIdx < lists.Count && lists[modelInfoIdx].ElemSize == 8 &&
+                lists[modelInfoIdx].Count == d.ModelsLoddings.Length)
+            {
+                var mi = lists[modelInfoIdx];
+                d.ModelInfos = new ModelInfoItem[mi.Count];
+                for (int i = 0; i < mi.Count; i++)
+                    d.ModelInfos[i] = new ModelInfoItem { Type = FirstUInt(mi.Items[i], 0), InfoIndex = FirstUInt(mi.Items[i], 4) };
+            }
+
+            // Fragile/structure info is after renders and has destroyed_model_index
+            // at byte 28 for both 36-byte and 40-byte versions.
+            for (int li = renderIdx + 1; li < lists.Count; li++)
+            {
+                var l = lists[li];
+                if (l.ElemSize != 36 && l.ElemSize != 40) continue;
+
+                int plausible = 0;
+                var tmp = new FragileInfoItem[l.Count];
+                for (int i = 0; i < l.Count; i++)
+                {
+                    uint destroyed = FirstUInt(l.Items[i], 28);
+                    uint entryType = FirstUInt(l.Items[i], 32);
+                    tmp[i] = new FragileInfoItem { DestroyedModelIndex = destroyed, EntryType = entryType };
+                    if (destroyed < d.ModelsLoddings.Length && entryType <= 3) plausible++;
+                }
+                if (l.Count == 0 || plausible > 0)
+                {
+                    d.FragileInfos = tmp;
+                    break;
+                }
+            }
+
+            WoTLogger.Info($"BSMO: models={d.ModelsLoddings.Length}, lods={d.LodRenders.Length}, renders={d.Renders.Length}, modelInfo={d.ModelInfos.Length}, fragile={d.FragileInfos.Length}");
             return d;
         }
 
         // =================== BSMA (materials) ===================
 
-        private class MaterialInfo
-        {
-            public int KeyFx;
-            public int KeyFrom;
-            public int KeyTo;
-        }
-
-        private class PropInfo
-        {
-            public uint PropFnv;
-            public uint ValueType;
-            public uint Value;   // raw; for type 6 it's a string fnv
-        }
-
-        private class BsmaData
-        {
-            public MaterialInfo[] Materials = Array.Empty<MaterialInfo>();
-            public PropInfo[] Props = Array.Empty<PropInfo>();
-        }
-
         private static BsmaData ReadBsma(BinaryReader br, Row row)
         {
             var d = new BsmaData();
             if (row.Length == 0) return d;
+            long end = row.Position + row.Length;
             br.BaseStream.Position = row.Position;
 
-            // materials: read_entries(MaterialInfo_1_6_0) -> [u32 size=16][u32 count][...]
+            // materials: [key_fx, key_from, key_to, identifier_fnv, optional identifier2_fnv]
+            if (br.BaseStream.Position + 8 <= end)
             {
-                uint sz = br.ReadUInt32();
-                uint cnt = br.ReadUInt32();
-                d.Materials = new MaterialInfo[cnt];
-                for (uint i = 0; i < cnt; i++)
+                var raw = ReadRawList(br);
+                d.Materials = new MaterialInfo[raw.Count];
+                for (int i = 0; i < raw.Count; i++)
                 {
-                    int keyFx = br.ReadInt32();
-                    int keyFrom = br.ReadInt32();
-                    int keyTo = br.ReadInt32();
-                    br.ReadUInt32(); // identifier_fnv
-                    d.Materials[i] = new MaterialInfo { KeyFx = keyFx, KeyFrom = keyFrom, KeyTo = keyTo };
+                    var b = raw.Items[i];
+                    d.Materials[i] = new MaterialInfo
+                    {
+                        KeyFx = FirstInt(b, 0),
+                        KeyFrom = FirstInt(b, 4),
+                        KeyTo = FirstInt(b, 8),
+                        IdentifierFnv = FirstUInt(b, 12),
+                        Identifier2Fnv = b.Length >= 20 ? FirstUInt(b, 16) : 0u,
+                    };
                 }
             }
-            // fx: read_entries(4, '<I')
-            { uint sz = br.ReadUInt32(); uint cnt = br.ReadUInt32(); br.BaseStream.Position += (long)sz * cnt; }
-            // props: read_entries(PropertyInfo) size=12
+
+            // fx: u32 fnv list
+            if (br.BaseStream.Position + 8 <= end)
             {
-                uint sz = br.ReadUInt32();
-                uint cnt = br.ReadUInt32();
-                d.Props = new PropInfo[cnt];
-                for (uint i = 0; i < cnt; i++)
+                var raw = ReadRawList(br);
+                d.Fx = FirstUInts(raw);
+            }
+
+            // props: PropertyInfo (prop_fnv, value_type, value)
+            if (br.BaseStream.Position + 8 <= end)
+            {
+                var raw = ReadRawList(br);
+                d.Props = new PropInfo[raw.Count];
+                for (int i = 0; i < raw.Count; i++)
                 {
-                    uint propFnv = br.ReadUInt32();
-                    uint vt = br.ReadUInt32();
-                    uint val = br.ReadUInt32();
-                    d.Props[i] = new PropInfo { PropFnv = propFnv, ValueType = vt, Value = val };
+                    var b = raw.Items[i];
+                    d.Props[i] = new PropInfo
+                    {
+                        PropFnv = FirstUInt(b, 0),
+                        ValueType = FirstUInt(b, 4),
+                        Value = FirstUInt(b, 8),
+                    };
                 }
             }
-            // We don't need matrices/vectors/textures for placement.
+
+            // matrices: not needed here
+            if (br.BaseStream.Position + 8 <= end)
+            {
+                try { ReadRawList(br); }
+                catch { return d; }
+            }
+
+            // vectors: value_type 5 references these.
+            if (br.BaseStream.Position + 8 <= end)
+            {
+                try
+                {
+                    var raw = ReadRawList(br);
+                    d.Vectors = new float[raw.Count][];
+                    for (int i = 0; i < raw.Count; i++)
+                    {
+                        var v = new float[4];
+                        if (raw.Items[i].Length >= 16)
+                            Buffer.BlockCopy(raw.Items[i], 0, v, 0, 16);
+                        d.Vectors[i] = v;
+                    }
+                }
+                catch { /* Textures block or version difference; ignore. */ }
+            }
+
+            WoTLogger.Info($"BSMA: materials={d.Materials.Length}, fx={d.Fx.Length}, props={d.Props.Length}, vectors={d.Vectors.Length}");
             return d;
         }
 
@@ -339,92 +629,204 @@ namespace WoTMapImporter.Editor.Package
             Dictionary<uint, string> strings,
             BsmiData bsmi, BsmoData bsmo, BsmaData bsma)
         {
-            uint diffuseMapFnv = Fnv1a32("diffuseMap");
-
             int n = Math.Min(bsmi.Transforms.Length, bsmi.ModelIds.Length);
-            int created = 0;
+            int skippedVisibility = 0;
+
             for (int i = 0; i < n; i++)
             {
-                uint modelId = bsmi.ModelIds[i];
-                if (modelId >= bsmo.ModelsLoddings.Length) continue;
-
-                uint lod0 = bsmo.ModelsLoddings[modelId].begin;
-                if (lod0 >= bsmo.LodRenders.Length) continue;
-
-                var (rsBegin, rsEnd) = bsmo.LodRenders[lod0];
-                for (uint rs = rsBegin; rs <= rsEnd && rs < bsmo.Renders.Length; rs++)
+                uint mask = (bsmi.VisibilityMasks != null && i < bsmi.VisibilityMasks.Length)
+                    ? bsmi.VisibilityMasks[i] : 0xffffffffu;
+                if ((mask & CaptureTheFlagVisibility) == 0)
                 {
-                    var r = bsmo.Renders[rs];
+                    skippedVisibility++;
+                    continue;
+                }
 
-                    // No shader -> skip (matches reference: key_fx == -1).
+                int modelId = (int)bsmi.ModelIds[i];
+                if (modelId < 0 || modelId >= bsmo.ModelsLoddings.Length) continue;
+
+                var placement = new ModelPlacement
+                {
+                    InstanceIndex = i,
+                    ModelId = modelId,
+                    Transform = bsmi.Transforms[i],
+                };
+                placement.Lods = BuildLodsForModel(strings, bsmo, bsma, modelId, false);
+                placement.DestroyedModelId = ResolveDestroyedModelId(bsmo, modelId);
+                if (placement.DestroyedModelId >= 0)
+                    placement.DestroyedLods = BuildLodsForModel(strings, bsmo, bsma, placement.DestroyedModelId, true);
+
+                if (placement.Lods.Count == 0 && placement.DestroyedLods.Count == 0)
+                    continue;
+
+                Placements.Add(placement);
+
+                // Legacy flat list: LOD0 intact only, matching old behaviour.
+                if (placement.Lods.Count > 0)
+                {
+                    foreach (var mesh in placement.Lods[0].Meshes)
+                    {
+                        Models.Add(new ModelInstance
+                        {
+                            PrimsName = mesh.PrimsName,
+                            VertsDataName = mesh.VertsDataName,
+                            PrimsDataName = mesh.PrimsDataName,
+                            PrimitiveGroup = mesh.PrimitiveGroup,
+                            DiffuseTexture = mesh.DiffuseTexture,
+                            Transform = placement.Transform,
+                        });
+                    }
+                }
+            }
+
+            WoTLogger.Info($"CompiledSpace: {Placements.Count} visible model placements, {Models.Count} legacy LOD0 render instances" +
+                           (skippedVisibility > 0 ? $", skipped by visibility={skippedVisibility}" : string.Empty));
+        }
+
+        private static List<ModelLod> BuildLodsForModel(
+            Dictionary<uint, string> strings, BsmoData bsmo, BsmaData bsma,
+            int modelId, bool destroyed)
+        {
+            var lods = new List<ModelLod>();
+            if (modelId < 0 || modelId >= bsmo.ModelsLoddings.Length) return lods;
+
+            var (lodBegin, lodEnd) = bsmo.ModelsLoddings[modelId];
+            if (lodBegin >= bsmo.LodRenders.Length) return lods;
+            if (lodEnd >= bsmo.LodRenders.Length) lodEnd = (uint)bsmo.LodRenders.Length - 1;
+            if (lodEnd < lodBegin) lodEnd = lodBegin;
+
+            for (uint lodId = lodBegin; lodId <= lodEnd; lodId++)
+            {
+                var (rsBegin, rsEnd) = bsmo.LodRenders[lodId];
+                if (rsBegin >= bsmo.Renders.Length) continue;
+                if (rsEnd >= bsmo.Renders.Length) rsEnd = (uint)bsmo.Renders.Length - 1;
+                if (rsEnd < rsBegin) rsEnd = rsBegin;
+
+                var lod = new ModelLod
+                {
+                    LodIndex = (int)(lodId - lodBegin),
+                    Distance = lodId < bsmo.LodDistances.Length ? bsmo.LodDistances[lodId] : 0f,
+                };
+
+                for (uint rsetId = rsBegin; rsetId <= rsEnd; rsetId++)
+                {
+                    var r = bsmo.Renders[rsetId];
                     if (r.MaterialIndex < bsma.Materials.Length &&
                         bsma.Materials[r.MaterialIndex].KeyFx == -1)
                         continue;
 
-                    string vertsFull = strings.TryGetValue(r.VertsNameFnv, out var vn) ? vn : null;
-                    string primsFull = strings.TryGetValue(r.PrimsNameFnv, out var pn) ? pn : null;
-                    if (string.IsNullOrEmpty(primsFull)) continue;
-
-                    SplitName(primsFull, out string primsName, out string primsData);
-                    SplitName(vertsFull ?? primsFull, out string vertsName, out string vertsData);
-
-                    primsName = primsName.Replace(".primitives", ".primitives_processed");
-
-                    string diffuse = ResolveDiffuse(strings, bsma, r.MaterialIndex, diffuseMapFnv);
-
-                    Models.Add(new ModelInstance
-                    {
-                        PrimsName = primsName,
-                        VertsDataName = vertsData,
-                        PrimsDataName = primsData,
-                        PrimitiveGroup = (int)r.PrimitiveIndex,
-                        DiffuseTexture = diffuse,
-                        Transform = bsmi.Transforms[i],
-                    });
-                    created++;
+                    var mesh = BuildRenderMesh(strings, bsma, r, (int)rsetId, destroyed);
+                    if (mesh != null)
+                        lod.Meshes.Add(mesh);
                 }
+
+                if (lod.Meshes.Count > 0)
+                    lods.Add(lod);
             }
-            WoTLogger.Info($"CompiledSpace: {Models.Count} render instances from {n} model placements");
+
+            return lods;
         }
 
-        private static string ResolveDiffuse(
-            Dictionary<uint, string> strings, BsmaData bsma, uint materialIndex, uint diffuseMapFnv)
+        private static RenderMesh BuildRenderMesh(
+            Dictionary<uint, string> strings, BsmaData bsma, RenderItem r,
+            int renderSetId, bool destroyed)
         {
-            if (materialIndex >= bsma.Materials.Length) return null;
-            var mat = bsma.Materials[materialIndex];
-            if (mat.KeyFrom < 0 || mat.KeyTo < 0) return null;
-            for (int k = mat.KeyFrom; k <= mat.KeyTo && k < bsma.Props.Length; k++)
+            string vertsFull = strings.TryGetValue(r.VertsNameFnv, out var vn) ? vn : null;
+            string primsFull = strings.TryGetValue(r.PrimsNameFnv, out var pn) ? pn : null;
+            if (string.IsNullOrEmpty(primsFull)) return null;
+
+            SplitName(primsFull, out string primsName, out string primsData);
+            SplitName(vertsFull ?? primsFull, out string vertsName, out string vertsData);
+
+            primsName = primsName.Replace(".primitives", ".primitives_processed");
+            vertsName = vertsName.Replace(".primitives", ".primitives_processed");
+            if (!string.Equals(primsName, vertsName, StringComparison.OrdinalIgnoreCase))
+                WoTLogger.Warn($"BSMO render {renderSetId}: verts/prims file differ ('{vertsName}' vs '{primsName}'), using prims file");
+
+            var mesh = new RenderMesh
             {
-                var p = bsma.Props[k];
-                if (p.PropFnv == diffuseMapFnv && p.ValueType == 6)
-                    return strings.TryGetValue(p.Value, out var s) ? s : null;
+                RenderSetId = renderSetId,
+                PrimitiveGroup = (int)r.PrimitiveIndex,
+                MaterialIndex = (int)r.MaterialIndex,
+                PrimsName = primsName,
+                VertsDataName = vertsData,
+                PrimsDataName = primsData,
+            };
+
+            if (r.MaterialIndex < bsma.Materials.Length)
+            {
+                var mat = bsma.Materials[r.MaterialIndex];
+                mesh.Identifier = strings.TryGetValue(mat.IdentifierFnv, out var id) ? id : null;
+                mesh.IsDestroyedMaterial = destroyed || (!string.IsNullOrEmpty(mesh.Identifier) && mesh.Identifier.StartsWith("d_", StringComparison.OrdinalIgnoreCase));
+                if (mat.KeyFx >= 0 && mat.KeyFx < bsma.Fx.Length)
+                    mesh.FxName = strings.TryGetValue(bsma.Fx[mat.KeyFx], out var fx) ? fx : null;
+
+                if (mat.KeyFrom >= 0 && mat.KeyTo >= mat.KeyFrom)
+                {
+                    int to = Math.Min(mat.KeyTo, bsma.Props.Length - 1);
+                    for (int k = mat.KeyFrom; k <= to; k++)
+                    {
+                        var p = bsma.Props[k];
+                        string propName = strings.TryGetValue(p.PropFnv, out var pname) ? pname : $"fnv_{p.PropFnv:X8}";
+                        var prop = new MaterialProperty
+                        {
+                            Name = propName,
+                            ValueType = p.ValueType,
+                            RawValue = p.Value,
+                        };
+                        if (p.ValueType == 6)
+                            prop.StringValue = strings.TryGetValue(p.Value, out var s) ? s : null;
+                        else if (p.ValueType == 5 && p.Value < bsma.Vectors.Length)
+                            prop.VectorValue = bsma.Vectors[p.Value];
+
+                        mesh.Props[propName] = prop;
+                    }
+                }
             }
-            return null;
+
+            return mesh;
+        }
+
+        private static int ResolveDestroyedModelId(BsmoData bsmo, int modelId)
+        {
+            if (modelId < 0 || modelId >= bsmo.ModelInfos.Length)
+                return -1;
+            uint infoIndex = bsmo.ModelInfos[modelId].InfoIndex;
+            if (infoIndex >= bsmo.FragileInfos.Length)
+                return -1;
+            uint destroyed = bsmo.FragileInfos[infoIndex].DestroyedModelIndex;
+            if (destroyed == uint.MaxValue || destroyed >= bsmo.ModelsLoddings.Length || destroyed == modelId)
+                return -1;
+            return (int)destroyed;
         }
 
         private static void SplitName(string full, out string name, out string dataName)
         {
+            if (string.IsNullOrEmpty(full))
+            {
+                name = string.Empty;
+                dataName = string.Empty;
+                return;
+            }
+            full = full.Replace('\\', '/');
             int idx = full.LastIndexOf('/');
             if (idx >= 0) { name = full.Substring(0, idx); dataName = full.Substring(idx + 1); }
-            else { name = full; dataName = ""; }
+            else { name = full; dataName = string.Empty; }
         }
 
         // FNV-1a 32-bit (WoT uses fnv1a_64 & 0xffffffff -> equivalent low 32 bits).
         public static uint Fnv1a32(string s)
         {
-            // Reference uses fnv1a_64(string) & 0xffffffff. Compute 64-bit then mask.
             ulong hval = 0xcbf29ce484222325UL;
             const ulong prime = 0x100000001b3UL;
             foreach (char c in s)
             {
-                hval ^= (byte)c;   // Latin-1: char code == byte value for our keys
+                hval ^= (byte)c;
                 hval *= prime;
             }
             return (uint)(hval & 0xffffffff);
         }
 
-        /// <summary>Latin-1 decode (byte value == char code). Avoids relying on
-        /// Encoding.Latin1 which isn't available on all Unity runtimes.</summary>
         private static string Latin1(byte[] bytes)
         {
             var chars = new char[bytes.Length];

@@ -182,6 +182,72 @@ namespace WoTMapImporter.Editor.Image
         }
 
         /// <summary>
+        /// Decodes a DXT1/DXT5 (also DX10 BC1/BC3) DDS to an uncompressed RGBA32
+        /// Texture2D.  Object import uses this instead of LoadRawTextureData so DDS
+        /// top-left/DirectX rows are converted to Unity/Blender bottom-left sampling.
+        /// </summary>
+        public static Texture2D ReadDecompressed(byte[] data, string name, bool linear = true, bool flipY = true)
+        {
+            if (!TryReadHeader(data, out var header))
+                throw new Exception("Not a DDS file");
+
+            int dataOffset = (int)header.Size + 4;
+            if (dataOffset + 4 > data.Length) dataOffset = 128;
+
+            int w = (int)header.Width, h = (int)header.Height;
+            string fourcc = FourCCToString(header.PfFourCC);
+            if (fourcc == "DX10")
+            {
+                uint dxgiFormat = BitConverter.ToUInt32(data, 128);
+                dataOffset = 148;
+                fourcc = dxgiFormat switch
+                {
+                    71 or 72 => "DXT1", // BC1_UNORM / BC1_UNORM_SRGB
+                    74 or 75 => "DXT5", // BC3_UNORM / BC3_UNORM_SRGB
+                    _ => throw new Exception($"ReadDecompressed unsupported DXGI format: {dxgiFormat}"),
+                };
+            }
+
+            int blockSize = fourcc switch
+            {
+                "DXT5" => 16,
+                "DXT1" => 8,
+                _ => throw new Exception($"ReadDecompressed unsupported FourCC: {fourcc}"),
+            };
+
+            var pixels = new Color32[w * h];
+            int blocksX = (w + 3) / 4;
+            int blocksY = (h + 3) / 4;
+            using (var ms = new MemoryStream(data, dataOffset, data.Length - dataOffset, false))
+            using (var br = new BinaryReader(ms))
+            {
+                for (int by = 0; by < blocksY; by++)
+                for (int bx = 0; bx < blocksX; bx++)
+                {
+                    if (ms.Position + blockSize > ms.Length) break;
+                    if (fourcc == "DXT5") DecodeDXT5Block(br, bx, by, w, h, pixels);
+                    else DecodeDXT1Block(br, bx, by, w, h, pixels);
+                }
+            }
+
+            if (flipY)
+            {
+                var flipped = new Color32[w * h];
+                for (int y = 0; y < h; y++)
+                    Array.Copy(pixels, y * w, flipped, (h - 1 - y) * w, w);
+                pixels = flipped;
+            }
+
+            var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, linear)
+            {
+                name = name, wrapMode = TextureWrapMode.Repeat, filterMode = FilterMode.Bilinear,
+            };
+            tex.SetPixels32(pixels);
+            tex.Apply(false, false);
+            return tex;
+        }
+
+        /// <summary>
         /// Decodes a DXT1/DXT5 DDS to an uncompressed RGBA32 Texture2D that is
         /// CPU-readable via GetPixels32(). Used for blend/normal maps where we
         /// must read pixel weights on the CPU (compressed textures via

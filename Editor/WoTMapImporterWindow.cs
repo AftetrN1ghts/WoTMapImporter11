@@ -25,6 +25,7 @@ namespace WoTMapImporter.Editor
     {
         private string _wotPath = @"C:\Games\World_of_Tanks";
         private string _outputFolder = "Assets/WoTImported";
+        private bool _loadTerrain = true;
         private bool _loadObjects = true;
         private bool _loadNormals = true;
         private bool _loadWetness = false;
@@ -50,6 +51,7 @@ namespace WoTMapImporter.Editor
         {
             _wotPath = EditorPrefs.GetString("WoTMapImporter.wotPath", _wotPath);
             _outputFolder = EditorPrefs.GetString("WoTMapImporter.outputFolder", _outputFolder);
+            _loadTerrain = EditorPrefs.GetBool("WoTMapImporter.loadTerrain", _loadTerrain);
             _terrainMode = (WoTMapImporter.TerrainImportMode)EditorPrefs.GetInt("WoTMapImporter.terrainMode", (int)_terrainMode);
         }
 
@@ -57,6 +59,7 @@ namespace WoTMapImporter.Editor
         {
             EditorPrefs.SetString("WoTMapImporter.wotPath", _wotPath);
             EditorPrefs.SetString("WoTMapImporter.outputFolder", _outputFolder);
+            EditorPrefs.SetBool("WoTMapImporter.loadTerrain", _loadTerrain);
             EditorPrefs.SetInt("WoTMapImporter.terrainMode", (int)_terrainMode);
         }
 
@@ -94,19 +97,25 @@ namespace WoTMapImporter.Editor
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Options", EditorStyles.boldLabel);
+            _loadTerrain = EditorGUILayout.Toggle("Import terrain", _loadTerrain);
             _loadObjects = EditorGUILayout.Toggle("Load static objects", _loadObjects);
-            _loadNormals = EditorGUILayout.Toggle("Load terrain normals", _loadNormals);
-            _loadWetness = EditorGUILayout.Toggle("Load wetness/roughness map", _loadWetness);
-            _terrainMode = (WoTMapImporter.TerrainImportMode)EditorGUILayout.EnumPopup("Terrain mode", _terrainMode);
-            using (new EditorGUI.DisabledScope(_terrainMode == WoTMapImporter.TerrainImportMode.MeshChunks))
+            using (new EditorGUI.DisabledScope(!_loadTerrain))
             {
-                _maxResolution = EditorGUILayout.IntPopup(
-                    "Max heightmap resolution",
-                    _maxResolution,
-                    new[] { "1025", "2049", "4097" },
-                    new[] { 1025, 2049, 4097 });
+                _loadNormals = EditorGUILayout.Toggle("Load terrain normals", _loadNormals);
+                _loadWetness = EditorGUILayout.Toggle("Load wetness/roughness map", _loadWetness);
+                _terrainMode = (WoTMapImporter.TerrainImportMode)EditorGUILayout.EnumPopup("Terrain mode", _terrainMode);
+                using (new EditorGUI.DisabledScope(_terrainMode == WoTMapImporter.TerrainImportMode.MeshChunks))
+                {
+                    _maxResolution = EditorGUILayout.IntPopup(
+                        "Max heightmap resolution",
+                        _maxResolution,
+                        new[] { "1025", "2049", "4097" },
+                        new[] { 1025, 2049, 4097 });
+                }
             }
-            if (_terrainMode == WoTMapImporter.TerrainImportMode.MeshChunks)
+            if (!_loadTerrain)
+                EditorGUILayout.HelpBox("Terrain import is disabled. The importer will still load space.bin static objects if 'Load static objects' is enabled.", MessageType.Info);
+            else if (_terrainMode == WoTMapImporter.TerrainImportMode.MeshChunks)
                 EditorGUILayout.HelpBox("MeshChunks uses one MeshRenderer per WoT .cdata chunk and samples original blend textures without Unity Terrain alphamap normalization.", MessageType.Info);
         }
 
@@ -289,6 +298,7 @@ namespace WoTMapImporter.Editor
             {
                 var settings = new WoTMapImporter.ImportSettings
                 {
+                    LoadTerrain = _loadTerrain,
                     LoadObjects = _loadObjects,
                     LoadNormals = _loadNormals,
                     LoadWetness = _loadWetness,
