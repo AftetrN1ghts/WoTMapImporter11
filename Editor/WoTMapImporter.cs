@@ -8,6 +8,7 @@ using UnityEngine;
 using WoTMapImporter.Editor.Data;
 using WoTMapImporter.Editor.Package;
 using WoTMapImporter.Editor.Terrain;
+using WoTMapImporter.Editor.Vegetation;
 using WoTMapImporter.Editor.Utils;
 using WoTMapImporter.Editor.Xml;
 
@@ -37,6 +38,7 @@ namespace WoTMapImporter.Editor
         {
             public bool LoadTerrain = true;
             public bool LoadObjects = true;
+            public bool LoadVegetation = true;
             public bool LoadNormals = true;
             public bool LoadWetness = false;
             public int MaxHeightmapResolution = 4097;
@@ -91,6 +93,7 @@ namespace WoTMapImporter.Editor
                 resourcePackages.Insert(0, "particles.pkg");
                 resourcePackages.Insert(0, $"{spaceName}_bin.pkg");
                 resourcePackages.Insert(0, $"{spaceName}.pkg");
+                AddOptionalResourcePackages(wotResPath, resourcePackages);
                 pkgMgr = new WoTPackageManager(wotResPath, resourcePackages);
 
                 progress?.Invoke(0.15f, "Loading space settings...");
@@ -142,18 +145,30 @@ namespace WoTMapImporter.Editor
                 if (terrainObject != null)
                     terrainObject.transform.SetParent(root.transform, false);
 
-                // ---- Static objects (from compiled space.bin) ----
-                if (settings.LoadObjects)
+                // ---- Static objects and SpeedTree vegetation (from compiled space.bin) ----
+                if (settings.LoadObjects || settings.LoadVegetation)
                 {
                     try
                     {
-                        progress?.Invoke(0.93f, "Loading static objects...");
-                        LoadStaticObjects(spaceDir, $"{outputFolder}/{mapInfo.Name}", pkgMgr, root, result);
+                        progress?.Invoke(0.92f, "Loading compiled space content...");
+                        var compiledSpace = LoadCompiledSpace(spaceDir, result);
+
+                        if (settings.LoadObjects && compiledSpace != null)
+                        {
+                            progress?.Invoke(0.94f, "Loading static objects...");
+                            LoadStaticObjects(compiledSpace, $"{outputFolder}/{mapInfo.Name}", pkgMgr, root, result);
+                        }
+
+                        if (settings.LoadVegetation && compiledSpace != null)
+                        {
+                            progress?.Invoke(0.97f, "Loading SpeedTree vegetation...");
+                            LoadVegetation(compiledSpace, $"{outputFolder}/{mapInfo.Name}", pkgMgr, root, result);
+                        }
                     }
                     catch (Exception oe)
                     {
-                        WoTLogger.Warn($"Static object loading failed: {oe.Message}\n{oe.StackTrace}");
-                        result.Warnings.Add("Object loading failed: " + oe.Message);
+                        WoTLogger.Warn($"Compiled-space content loading failed: {oe.Message}\n{oe.StackTrace}");
+                        result.Warnings.Add("Compiled-space content loading failed: " + oe.Message);
                     }
                 }
 
@@ -226,6 +241,33 @@ namespace WoTMapImporter.Editor
                 list.Add(fname);
             }
             return list;
+        }
+
+        private static void AddOptionalResourcePackages(string wotResPath, List<string> packages)
+        {
+            if (!Directory.Exists(wotResPath) || packages == null) return;
+            var seen = new HashSet<string>(packages, StringComparer.OrdinalIgnoreCase);
+
+            void AddIfExists(string pkgName)
+            {
+                if (string.IsNullOrEmpty(pkgName) || seen.Contains(pkgName)) return;
+                if (!File.Exists(Path.Combine(wotResPath, pkgName))) return;
+                packages.Add(pkgName);
+                seen.Add(pkgName);
+            }
+
+            // SpeedTree resources are normally in shared*.pkg, but some clients/modded
+            // installs use separate content/vegetation packages.  Add them if present
+            // without forcing the importer to open every game package.
+            AddIfExists("content.pkg");
+            AddIfExists("misc.pkg");
+            AddIfExists("vegetation.pkg");
+            AddIfExists("speedtree.pkg");
+
+            foreach (var f in Directory.GetFiles(wotResPath, "vegetation*.pkg"))
+                AddIfExists(Path.GetFileName(f));
+            foreach (var f in Directory.GetFiles(wotResPath, "speedtree*.pkg"))
+                AddIfExists(Path.GetFileName(f));
         }
 
         private static void ExtractZip(string zipPath, string destDir)
@@ -542,21 +584,27 @@ namespace WoTMapImporter.Editor
             return chunks;
         }
 
-        // =================== STATIC OBJECTS ===================
+        // =================== COMPILED SPACE CONTENT ===================
 
-        private static void LoadStaticObjects(
-            string spaceDir, string outputPath, WoTPackageManager pkgMgr,
-            GameObject root, ImportResult result)
+        private static CompiledSpace LoadCompiledSpace(string spaceDir, ImportResult result)
         {
             string spaceBinPath = Path.Combine(spaceDir, "space.bin");
             if (!File.Exists(spaceBinPath))
             {
-                WoTLogger.Warn("space.bin not found; skipping static objects (old-format spaces not supported yet)");
-                return;
+                string msg = "space.bin not found; skipping static objects/vegetation (old-format spaces not supported yet)";
+                WoTLogger.Warn(msg);
+                result.Warnings.Add(msg);
+                return null;
             }
 
             byte[] bin = File.ReadAllBytes(spaceBinPath);
-            var space = Package.CompiledSpace.Parse(bin);
+            return Package.CompiledSpace.Parse(bin);
+        }
+
+        private static void LoadStaticObjects(
+            CompiledSpace space, string outputPath, WoTPackageManager pkgMgr,
+            GameObject root, ImportResult result)
+        {
             if (space.Placements.Count == 0)
             {
                 WoTLogger.Warn("CompiledSpace produced 0 visible model placements");
@@ -577,6 +625,32 @@ namespace WoTMapImporter.Editor
             }
 
             WoTLogger.Info($"Static objects: {space.Placements.Count} placements, {space.Models.Count} LOD0 render instances (legacy count)");
+        }
+
+        private static void LoadVegetation(
+            CompiledSpace space, string outputPath, WoTPackageManager pkgMgr,
+            GameObject root, ImportResult result)
+        {
+            if (space.SpeedTrees.Count == 0)
+            {
+                WoTLogger.Warn("CompiledSpace produced 0 SpeedTree vegetation placements");
+                return;
+            }
+
+            var vegetationBuild = VegetationBuilder.Build(outputPath, space, pkgMgr);
+            if (vegetationBuild.Root != null)
+            {
+                vegetationBuild.Root.transform.SetParent(root.transform, false);
+                ApplyRequestedObjectsRootTransform(vegetationBuild.Root.transform);
+            }
+
+            foreach (var w in vegetationBuild.Warnings)
+            {
+                WoTLogger.Info(w);
+                result.Warnings.Add(w);
+            }
+
+            WoTLogger.Info($"Vegetation: {space.SpeedTrees.Count} SpTr placements");
         }
 
         private static void ApplyRequestedObjectsRootTransform(Transform objectsRoot)

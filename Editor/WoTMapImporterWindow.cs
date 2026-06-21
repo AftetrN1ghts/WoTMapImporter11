@@ -27,6 +27,7 @@ namespace WoTMapImporter.Editor
         private string _outputFolder = "Assets/WoTImported";
         private bool _loadTerrain = true;
         private bool _loadObjects = true;
+        private bool _loadVegetation = true;
         private bool _loadNormals = true;
         private bool _loadWetness = false;
         private int _maxResolution = 4097;
@@ -52,6 +53,8 @@ namespace WoTMapImporter.Editor
             _wotPath = EditorPrefs.GetString("WoTMapImporter.wotPath", _wotPath);
             _outputFolder = EditorPrefs.GetString("WoTMapImporter.outputFolder", _outputFolder);
             _loadTerrain = EditorPrefs.GetBool("WoTMapImporter.loadTerrain", _loadTerrain);
+            _loadObjects = EditorPrefs.GetBool("WoTMapImporter.loadObjects", _loadObjects);
+            _loadVegetation = EditorPrefs.GetBool("WoTMapImporter.loadVegetation", _loadVegetation);
             _terrainMode = (WoTMapImporter.TerrainImportMode)EditorPrefs.GetInt("WoTMapImporter.terrainMode", (int)_terrainMode);
         }
 
@@ -60,6 +63,8 @@ namespace WoTMapImporter.Editor
             EditorPrefs.SetString("WoTMapImporter.wotPath", _wotPath);
             EditorPrefs.SetString("WoTMapImporter.outputFolder", _outputFolder);
             EditorPrefs.SetBool("WoTMapImporter.loadTerrain", _loadTerrain);
+            EditorPrefs.SetBool("WoTMapImporter.loadObjects", _loadObjects);
+            EditorPrefs.SetBool("WoTMapImporter.loadVegetation", _loadVegetation);
             EditorPrefs.SetInt("WoTMapImporter.terrainMode", (int)_terrainMode);
         }
 
@@ -99,6 +104,7 @@ namespace WoTMapImporter.Editor
             EditorGUILayout.LabelField("Options", EditorStyles.boldLabel);
             _loadTerrain = EditorGUILayout.Toggle("Import terrain", _loadTerrain);
             _loadObjects = EditorGUILayout.Toggle("Load static objects", _loadObjects);
+            _loadVegetation = EditorGUILayout.Toggle("Load SpeedTree vegetation", _loadVegetation);
             using (new EditorGUI.DisabledScope(!_loadTerrain))
             {
                 _loadNormals = EditorGUILayout.Toggle("Load terrain normals", _loadNormals);
@@ -300,6 +306,7 @@ namespace WoTMapImporter.Editor
                 {
                     LoadTerrain = _loadTerrain,
                     LoadObjects = _loadObjects,
+                    LoadVegetation = _loadVegetation,
                     LoadNormals = _loadNormals,
                     LoadWetness = _loadWetness,
                     MaxHeightmapResolution = _maxResolution,

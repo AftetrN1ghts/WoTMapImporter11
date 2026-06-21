@@ -90,8 +90,22 @@ namespace WoTMapImporter.Editor.Package
             public List<ModelLod> DestroyedLods = new List<ModelLod>();
         }
 
+        public sealed class SpeedTreePlacement
+        {
+            public int InstanceIndex;
+            public string ResourceName;
+            public uint ResourceFnv;
+            public uint Seed;
+            public bool CastsShadow;
+            public bool CastsLocalShadow;
+            public bool AlwaysDynamic;
+            public uint VisibilityMask;
+            public float[] Transform;
+        }
+
         public readonly List<ModelInstance> Models = new List<ModelInstance>();
         public readonly List<ModelPlacement> Placements = new List<ModelPlacement>();
+        public readonly List<SpeedTreePlacement> SpeedTrees = new List<SpeedTreePlacement>();
 
         private struct Row
         {
@@ -193,6 +207,12 @@ namespace WoTMapImporter.Editor.Package
             var strings = new Dictionary<uint, string>();
             if (rows.TryGetValue("BWST", out var bwstRow))
                 strings = ReadBwst(br, bwstRow);
+
+            // SpeedTree vegetation is independent from BSMI/BSMO static models.
+            // Parse it even on spaces where ordinary model sections are absent or
+            // broken, so the vegetation importer can still place trees.
+            if (rows.TryGetValue("SpTr", out var sptrRow))
+                ReadSpeedTrees(br, sptrRow, strings);
 
             if (!rows.TryGetValue("BSMI", out var bsmiRow) ||
                 !rows.TryGetValue("BSMO", out var bsmoRow))
@@ -329,6 +349,100 @@ namespace WoTMapImporter.Editor.Package
         private static float FirstFloat(byte[] b, int offset = 0)
         {
             return b != null && b.Length >= offset + 4 ? BitConverter.ToSingle(b, offset) : 0f;
+        }
+
+
+        // =================== SpTr (SpeedTree vegetation) ===================
+
+        private void ReadSpeedTrees(BinaryReader br, Row row, Dictionary<uint, string> strings)
+        {
+            try
+            {
+                var lists = ReadAllLists(br, row);
+                int listIndex = -1;
+                for (int i = 0; i < lists.Count; i++)
+                {
+                    // WoT 0.9.12: 76 bytes (no visibility mask).
+                    // WoT 0.9.20+ / 1.0+: 80 bytes.
+                    if (lists[i].ElemSize == 76 || lists[i].ElemSize == 80)
+                    {
+                        listIndex = i;
+                        break;
+                    }
+                }
+
+                if (listIndex < 0)
+                {
+                    WoTLogger.Warn($"SpTr: no speedtree placement list found (lists={lists.Count})");
+                    return;
+                }
+
+                var raw = lists[listIndex];
+                int skippedVisibility = 0;
+                int unresolved = 0;
+                for (int i = 0; i < raw.Count; i++)
+                {
+                    var b = raw.Items[i];
+                    if (b == null || b.Length < 76) continue;
+
+                    var t = new float[16];
+                    Buffer.BlockCopy(b, 0, t, 0, 16 * 4);
+
+                    uint resourceFnv = FirstUInt(b, 64);
+                    uint seed = FirstUInt(b, 68);
+                    uint flags = FirstUInt(b, 72);
+                    uint visibilityMask = b.Length >= 80 ? FirstUInt(b, 76) : 0xffffffffu;
+                    if ((visibilityMask & CaptureTheFlagVisibility) == 0)
+                    {
+                        skippedVisibility++;
+                        continue;
+                    }
+
+                    strings.TryGetValue(resourceFnv, out var resourceName);
+                    if (string.IsNullOrEmpty(resourceName)) unresolved++;
+
+                    bool castsShadow = (flags & 0x1u) != 0;
+                    bool castsLocalShadow;
+                    bool alwaysDynamic;
+                    bool modernSrtLayout = !string.IsNullOrEmpty(resourceName) &&
+                                           resourceName.EndsWith(".srt", StringComparison.OrdinalIgnoreCase);
+                    if (modernSrtLayout)
+                    {
+                        // WoT 1.0+ .srt entries: bit0 castsShadow,
+                        // bit1 castsLocalShadow, bit2 alwaysDynamic.
+                        castsLocalShadow = (flags & 0x2u) != 0;
+                        alwaysDynamic = (flags & 0x4u) != 0;
+                    }
+                    else
+                    {
+                        // WoT 0.9.x .spt entries: bit1 is reflectionVisible, bit2 is
+                        // castsLocalShadow, bit3 editorOnly/castsShadow.  v0.9.20 also
+                        // uses row.Int1=3, so the extension is a safer discriminator.
+                        castsLocalShadow = (flags & 0x4u) != 0;
+                        alwaysDynamic = false;
+                    }
+
+                    SpeedTrees.Add(new SpeedTreePlacement
+                    {
+                        InstanceIndex = i,
+                        ResourceName = resourceName,
+                        ResourceFnv = resourceFnv,
+                        Seed = seed,
+                        CastsShadow = castsShadow,
+                        CastsLocalShadow = castsLocalShadow,
+                        AlwaysDynamic = alwaysDynamic,
+                        VisibilityMask = visibilityMask,
+                        Transform = t,
+                    });
+                }
+
+                WoTLogger.Info($"SpTr: speedtrees={SpeedTrees.Count}, unresolvedNames={unresolved}" +
+                               (skippedVisibility > 0 ? $", skipped by visibility={skippedVisibility}" : string.Empty));
+            }
+            catch (Exception e)
+            {
+                WoTLogger.Warn($"SpTr parse failed: {e.Message}");
+            }
         }
 
         // =================== BSMI (instances) ===================

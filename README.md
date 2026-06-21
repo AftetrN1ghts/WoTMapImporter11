@@ -11,9 +11,11 @@ into your Unity project. Inspired by [Simi4/WoT-Blender-Addons](https://github.c
 - ✅ Imports terrain either as **Mesh Chunks** (recommended, WoT-like raw blending) or as Unity Terrain
 - ✅ Replicates WoT's blend-layer logic (new + old formats)
 - ✅ Imports layer diffuse + normal textures (PNG/DDS)
-- ✅ Loads static objects via `.primitives_processed` (basic geometry + diffuse)
+- ✅ Loads static objects via compiled `space.bin` + `.primitives_processed` geometry/material data
+- ✅ Parses `SpTr` SpeedTree vegetation placements from `space.bin`
+- ✅ Decodes original WoT SpeedTree Runtime `.srt` static 3D geometry (SRT 06/07), creates LOD prefabs and places them from `SpTr`
+- ⚠️ SRT wind/billboard-only LODs/collision are not implemented yet; unsupported `.spt`/unknown SRT layouts still fall back to green placeholders
 - ⚠️ Atlas shaders / PBS_tiled_atlas: simplified (diffuse only, no per-pixel blend masks)
-- ⚠️ Full CompiledSpace (space.bin) parsing not yet implemented; falls back to chunk name → bounds
 - ⚠️ Water / sky: not implemented yet
 
 ## Requirements
@@ -46,6 +48,28 @@ By default the importer creates one MeshRenderer per WoT `*.cdata` terrain chunk
 switch back to the older Unity Terrain mode from the window. Generated meshes, materials,
 textures and prefabs are saved under your Output Folder.
 
+### SpeedTree vegetation
+
+Enable **Load SpeedTree vegetation** in the importer window. The importer reads the `SpTr`
+section of `space.bin`, copies referenced tree resources to:
+
+```
+Assets/.../<MapName>/VegetationAssets/
+```
+
+and creates a `Vegetation` hierarchy with one instance per WoT placement. For original
+WoT `.srt` resources it now runs a built-in minimal SRT decoder and creates generated
+prefabs under:
+
+```
+Assets/.../<MapName>/VegetationAssets/_DecodedSRT/
+```
+
+Implemented: SRT 06/07 static mesh geometry, UVs, normals, indices, LOD hierarchy and
+diffuse DDS material lookup. Not implemented yet: SpeedTree wind shader data, collision
+objects, and pure billboard LOD rendering. If a tree is `.spt` or uses an unknown SRT
+layout, the importer keeps a green cross placeholder so the placement is still visible.
+
 ## How it works
 
 The plugin reads `.pkg` files (which are just ZIP archives):
@@ -53,7 +77,7 @@ The plugin reads `.pkg` files (which are just ZIP archives):
 - `arena_defs/_list_.xml` — list of all maps
 - `arena_defs/<map>.xml` — bounding box, geometry path
 - `<map>.pkg` and `<map>_bin.pkg` — actual map data
-- `particles.pkg`, `shared*.pkg` — additional resources (textures, models)
+- `particles.pkg`, `shared*.pkg`, optional `content.pkg`/`vegetation*.pkg`/`speedtree*.pkg` — additional resources (textures, models, SpeedTrees)
 
 Each terrain chunk is a `*.cdata` file (also a ZIP) containing:
 
@@ -96,11 +120,12 @@ The plugin packs these weights into Unity's splat maps (each tile holds 4 layer 
 | Terrain blend layers (old) | ✅ Full |
 | Terrain tileable UV projection | ⚠️ Approximate — uses 10m default tile size |
 | Wetness / global AM map | ⚠️ Disabled by default |
-| Static objects (basic) | ✅ Simple diffuse + geometry |
+| Static objects | ✅ CompiledSpace placements, LOD hierarchy, destructible variants |
+| SpeedTree placements (`SpTr`) | ✅ Placement + original `.srt` static mesh decode; fallback placeholders for unsupported resources |
 | Atlas shaders (PBS_tiled_atlas) | ⚠️ Diffuse only, no proper blending |
 | Water planes | ❌ Not implemented |
 | Sky / lighting | ❌ Not implemented |
-| CompiledSpace space.bin | ❌ Falls back to cdata-based bounds |
+| CompiledSpace space.bin | ✅ Static objects + vegetation + terrain metadata |
 
 ## License
 
