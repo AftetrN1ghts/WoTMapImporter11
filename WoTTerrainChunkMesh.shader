@@ -145,6 +145,19 @@ Shader "WoT/TerrainChunkMesh"
                 // as broad strips between chunk rows. Use the same rotation/scale
                 // parameters that TerrainMeshBuilder extracts from the Blender matrix.
                 float2 p = positionWS.xz;
+                // Same new-format X strip-order fix as the CPU baker.  Mirror by
+                // CHUNK INDEX, not by continuous p.x, so the strips swap as
+                // ... 2, 1, -1, -2 ... without reversing each strip internally.
+                if (_NewBlendFormat > 0.5)
+                {
+                    float numX = rcp(_ChunkUV_ST.x);
+                    float chunkSizeX = _TerrainGlobal.z / max(numX, 1.0);
+                    float minChunkX = _TerrainGlobal.x / max(chunkSizeX, 1e-5);
+                    float maxChunkX = minChunkX + numX - 1.0;
+                    float chunkX = round(_ChunkUV_ST.z * numX + minChunkX);
+                    float mirroredChunkX = minChunkX + maxChunkX - chunkX;
+                    p.x = (mirroredChunkX + localUV.x) * chunkSizeX;
+                }
                 float a = _LayerMap[idx].x;
                 float ca = cos(a);
                 float sa = sin(a);

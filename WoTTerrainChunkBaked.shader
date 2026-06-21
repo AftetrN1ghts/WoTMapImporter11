@@ -6,6 +6,12 @@ Shader "WoT/TerrainChunkBaked"
     {
         _MainTex ("Chunk Albedo", 2D) = "white" {}
         _Brightness ("Brightness", Float) = 1
+
+        // UV correction for already baked chunk textures.
+        // 0=None, 1=90 CW, 2=180, 3=270 CW. Default 2 means rotate baked texture by 180 degrees.
+        [Enum(None,0,Rotate 90 CW,1,Rotate 180,2,Rotate 270 CW,3)] _UVRotation ("Baked UV Rotation", Float) = 2
+        [Toggle] _UVFlipX ("Flip U / X", Float) = 0
+        [Toggle] _UVFlipY ("Flip V / Y", Float) = 0
     }
 
     SubShader
@@ -30,6 +36,9 @@ Shader "WoT/TerrainChunkBaked"
             CBUFFER_START(UnityPerMaterial)
                 float4 _MainTex_ST;
                 float _Brightness;
+                float _UVRotation;
+                float _UVFlipX;
+                float _UVFlipY;
             CBUFFER_END
 
             struct Attributes
@@ -52,13 +61,43 @@ Shader "WoT/TerrainChunkBaked"
                 VertexPositionInputs p = GetVertexPositionInputs(IN.positionOS.xyz);
                 OUT.positionHCS = p.positionCS;
                 OUT.normalWS = TransformObjectToWorldNormal(IN.normalOS);
-                OUT.uv = TRANSFORM_TEX(IN.uv, _MainTex);
+                // Keep raw mesh UV here. Texture correction is done in the fragment
+                // shader so changing material values updates instantly in the Scene view.
+                OUT.uv = IN.uv;
                 return OUT;
+            }
+
+            float2 RotateBakedUV(float2 uv)
+            {
+                // Rotate around the centre of the baked chunk texture.
+                // These formulas keep UVs inside 0..1 for regular terrain UV0.
+                if (_UVRotation > 0.5 && _UVRotation < 1.5)
+                {
+                    // 90 degrees clockwise
+                    uv = float2(1.0 - uv.y, uv.x);
+                }
+                else if (_UVRotation >= 1.5 && _UVRotation < 2.5)
+                {
+                    // 180 degrees
+                    uv = float2(1.0 - uv.x, 1.0 - uv.y);
+                }
+                else if (_UVRotation >= 2.5)
+                {
+                    // 270 degrees clockwise / 90 degrees counter-clockwise
+                    uv = float2(uv.y, 1.0 - uv.x);
+                }
+
+                if (_UVFlipX > 0.5) uv.x = 1.0 - uv.x;
+                if (_UVFlipY > 0.5) uv.y = 1.0 - uv.y;
+
+                return uv;
             }
 
             half4 frag(Varyings IN) : SV_Target
             {
-                float3 albedo = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, IN.uv).rgb;
+                float2 uv = RotateBakedUV(IN.uv);
+                uv = TRANSFORM_TEX(uv, _MainTex);
+                float3 albedo = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, uv).rgb;
                 float3 nWS = normalize(IN.normalWS);
                 Light mainLight = GetMainLight();
                 float ndotl = saturate(dot(nWS, mainLight.direction));

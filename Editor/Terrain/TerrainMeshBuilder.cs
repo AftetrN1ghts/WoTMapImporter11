@@ -273,6 +273,13 @@ namespace WoTMapImporter.Editor.Terrain
                 for (int x = 0; x < resolution; x++)
                 {
                     float u = (x + 0.5f) / resolution;
+
+                    // Rotate texture 180 degrees around the Y axis only.
+                    // In UV terms this is a horizontal texture flip: U -> 1-U, V unchanged.
+                    // Mesh vertices, chunk positions, mesh UVs and shader stay unchanged.
+                    float bakeU = 1f - u;
+                    float bakeV = v;
+
                     Vector3 acc = Vector3.zero;
                     float wsum = 0f;
 
@@ -280,19 +287,19 @@ namespace WoTMapImporter.Editor.Terrain
                     {
                         Texture2D lt = layerTextures[li];
                         if (lt == null) continue;
-                        float w = SampleLayerWeight(chunk, li, u, v, out Vector3 oldFmtWeight);
+                        float w = SampleLayerWeight(chunk, li, bakeU, bakeV, out Vector3 oldFmtWeight);
 
                         Color col;
                         if (chunk.IsNewBlendFormat)
                         {
-                            Vector2 luv = ComputeLayerUvForBake(chunk, chunkSize, u, v, layerMap[li]);
+                            Vector2 luv = ComputeLayerUvForBake(chunk, chunkSize, bakeU, bakeV, layerMap[li]);
                             col = SampleRepeat(lt, luv.x, luv.y);
                             acc += new Vector3(col.r, col.g, col.b) * w;
                             wsum += w;
                         }
                         else
                         {
-                            Vector2 luv = ComputeLayerUvForBake(chunk, chunkSize, u, v, layerMap[li]);
+                            Vector2 luv = ComputeLayerUvForBake(chunk, chunkSize, bakeU, bakeV, layerMap[li]);
                             col = SampleRepeat(lt, luv.x, luv.y);
                             acc += Vector3.Scale(new Vector3(col.r, col.g, col.b), oldFmtWeight);
                             wsum += Mathf.Max(oldFmtWeight.x, Mathf.Max(oldFmtWeight.y, oldFmtWeight.z));
@@ -301,7 +308,7 @@ namespace WoTMapImporter.Editor.Terrain
 
                     if (wsum <= 1e-4f && layerCount > 0 && layerTextures[0] != null)
                     {
-                        Vector2 luv = ComputeLayerUvForBake(chunk, chunkSize, u, v, layerMap[0]);
+                        Vector2 luv = ComputeLayerUvForBake(chunk, chunkSize, bakeU, bakeV, layerMap[0]);
                         Color c = SampleRepeat(layerTextures[0], luv.x, luv.y);
                         acc = new Vector3(c.r, c.g, c.b);
                     }
