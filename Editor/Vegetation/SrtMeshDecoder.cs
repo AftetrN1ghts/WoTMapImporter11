@@ -609,7 +609,7 @@ namespace WoTMapImporter.Editor.Vegetation
                 go.AddComponent<MeshFilter>().sharedMesh = meshAsset;
                 var renderer = go.AddComponent<MeshRenderer>();
                 renderer.sharedMaterial = GetOrCreateMaterial(rootDir, resourceName, part.RenderStateIndex, srt, resMgr, materialCache, warnings);
-                lodRenderers[part.LodIndex].Add(renderer);
+                lodRenderers[unityLodIndex].Add(renderer);
             }
 
             // Add a Unity LODGroup when possible, but keep LOD0 visible in editor.
