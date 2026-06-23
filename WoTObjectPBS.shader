@@ -1,39 +1,25 @@
-// WoT static-object preview shader.
-// Supports the material cases used by map objects in the Blender addon:
-// 0 - simple diffuseMap
-// 1 - PBS_tiled.fx (3 tiled albedoHeight textures + blendMask on uv2)
-// 2 - PBS_tiled_atlas.fx with atlasAlbedoHeight as one DDS atlas
-// 3 - PBS_tiled_atlas.fx with atlasAlbedoHeight .atlas metadata (tiles loaded separately)
-//
-// Normal map support:
-//   _NormalMap / _BumpMap are sampled and applied as a tangent-space normal.
-//   If neither is assigned the mesh normal is used as-is (same as before).
 Shader "WoT/ObjectPBS"
 {
     Properties
     {
-        _MainTex      ("Diffuse",             2D)      = "white"  {}
-        _Tile0        ("Tile 0",              2D)      = "white"  {}
-        _Tile1        ("Tile 1",              2D)      = "white"  {}
-        _Tile2        ("Tile 2",              2D)      = "white"  {}
-        _BlendMask    ("Blend Mask",          2D)      = "black"  {}
-        _AtlasTex     ("Atlas Albedo/Height", 2D)      = "white"  {}
-        _AtlasBlend   ("Atlas Blend",         2D)      = "black"  {}
-
-        // Normal map – same slot name as URP Lit so material inspector
-        // shows a proper "Normal Map" preview label.
-        [Normal] _NormalMap ("Normal Map", 2D) = "bump" {}
-        _BumpScale    ("Normal Scale",        Float)   = 1.0
-
-        _ObjectColor  ("Object Color",        Color)   = (1,1,1,1)
-        _Tile0Tint    ("Tile 0 Tint",         Vector)  = (1,1,1,1)
-        _Tile1Tint    ("Tile 1 Tint",         Vector)  = (1,1,1,1)
-        _Tile2Tint    ("Tile 2 Tint",         Vector)  = (1,1,1,1)
-        _AtlasIndexes ("Atlas Indexes",       Vector)  = (0,1,2,3)
-        _AtlasGrid    ("Atlas Grid",          Vector)  = (1,1,0,0)
-        _UseUv2Blend  ("Use UV2 For Blend",   Float)   = 1
-        _Mode         ("Mode",                Float)   = 0
-        _Brightness   ("Preview Brightness",  Float)   = 1
+        _MainTex      ("Diffuse",             2D)    = "white" {}
+        _Tile0        ("Tile 0",              2D)    = "white" {}
+        _Tile1        ("Tile 1",              2D)    = "white" {}
+        _Tile2        ("Tile 2",              2D)    = "white" {}
+        _BlendMask    ("Blend Mask",          2D)    = "black" {}
+        _AtlasTex     ("Atlas Albedo/Height", 2D)    = "white" {}
+        _AtlasBlend   ("Atlas Blend",         2D)    = "black" {}
+        [Normal] _NormalMap ("Normal Map",    2D)    = "bump"  {}
+        _BumpScale    ("Normal Scale",       Float)  = 1.0
+        _ObjectColor  ("Object Color",       Color)  = (1,1,1,1)
+        _Tile0Tint    ("Tile 0 Tint",        Vector) = (1,1,1,1)
+        _Tile1Tint    ("Tile 1 Tint",        Vector) = (1,1,1,1)
+        _Tile2Tint    ("Tile 2 Tint",        Vector) = (1,1,1,1)
+        _AtlasIndexes ("Atlas Indexes",      Vector) = (0,1,2,3)
+        _AtlasGrid    ("Atlas Grid",         Vector) = (1,1,0,0)
+        _UseUv2Blend  ("Use UV2 For Blend",  Float)  = 1
+        _Mode         ("Mode",               Float)  = 0
+        _Brightness   ("Preview Brightness", Float)  = 1
     }
 
     SubShader
@@ -49,10 +35,14 @@ Shader "WoT/ObjectPBS"
             #pragma vertex vert
             #pragma fragment frag
             #pragma target 3.5
-
-            // Enable the normal-map variant keyword so Unity knows this
-            // material needs tangents.
-            #pragma shader_feature_local _NORMALMAP
+            
+            // Обязательные URP keywords для теней
+            #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
+            #pragma multi_compile_fragment _ _SHADOWS_SOFT _SHADOWS_SOFT_LOW
+            #pragma multi_compile _ SHADOWS_SHADOWMASK
+            #pragma multi_compile_fragment _ _SHADOW_CASCADES_BLEND
+            #pragma multi_compile_instancing
+            #pragma multi_compile_fog
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
@@ -65,17 +55,12 @@ Shader "WoT/ObjectPBS"
 
             CBUFFER_START(UnityPerMaterial)
                 float4 _MainTex_ST;
-                float4 _Tile0_ST;
-                float4 _Tile1_ST;
-                float4 _Tile2_ST;
+                float4 _Tile0_ST;   float4 _Tile1_ST;   float4 _Tile2_ST;
                 float4 _BlendMask_ST;
-                float4 _AtlasTex_ST;
-                float4 _AtlasBlend_ST;
+                float4 _AtlasTex_ST; float4 _AtlasBlend_ST;
                 float4 _NormalMap_ST;
                 float4 _ObjectColor;
-                float4 _Tile0Tint;
-                float4 _Tile1Tint;
-                float4 _Tile2Tint;
+                float4 _Tile0Tint;  float4 _Tile1Tint;  float4 _Tile2Tint;
                 float4 _AtlasIndexes;
                 float4 _AtlasGrid;
                 float  _UseUv2Blend;
@@ -91,98 +76,79 @@ Shader "WoT/ObjectPBS"
                 float4 tangentOS  : TANGENT;
                 float2 uv         : TEXCOORD0;
                 float2 uv2        : TEXCOORD1;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
             struct Varyings
             {
-                float4 positionHCS : SV_POSITION;
-                float3 normalWS    : TEXCOORD0;
-                float2 uv          : TEXCOORD1;
-                float2 uv2         : TEXCOORD2;
-                float3 tangentWS   : TEXCOORD3;
-                float3 bitangentWS : TEXCOORD4;
+                float4 positionHCS  : SV_POSITION;
+                float3 positionWS   : TEXCOORD0;
+                float3 normalWS     : TEXCOORD1;
+                float2 uv           : TEXCOORD2;
+                float2 uv2          : TEXCOORD3;
+                float3 tangentWS    : TEXCOORD4;
+                float3 bitangentWS  : TEXCOORD5;
+                float  fogFactor    : TEXCOORD6;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
             Varyings vert(Attributes IN)
             {
                 Varyings OUT;
-                VertexPositionInputs p = GetVertexPositionInputs(IN.positionOS.xyz);
-                OUT.positionHCS  = p.positionCS;
-                OUT.normalWS     = TransformObjectToWorldNormal(IN.normalOS);
-                OUT.tangentWS    = TransformObjectToWorldDir(IN.tangentOS.xyz);
-                OUT.bitangentWS  = cross(OUT.normalWS, OUT.tangentWS) * IN.tangentOS.w;
-                OUT.uv  = IN.uv;
-                OUT.uv2 = IN.uv2;
+                UNITY_SETUP_INSTANCE_ID(IN);
+                UNITY_TRANSFER_INSTANCE_ID(IN, OUT);
+
+                VertexPositionInputs posInputs = GetVertexPositionInputs(IN.positionOS.xyz);
+                VertexNormalInputs   nrmInputs = GetVertexNormalInputs(IN.normalOS, IN.tangentOS);
+
+                OUT.positionHCS  = posInputs.positionCS;
+                OUT.positionWS   = posInputs.positionWS;
+                OUT.fogFactor    = ComputeFogFactor(posInputs.positionCS.z);
+                OUT.normalWS     = nrmInputs.normalWS;
+                OUT.tangentWS    = nrmInputs.tangentWS;
+                OUT.bitangentWS  = nrmInputs.bitangentWS;
+                OUT.uv           = IN.uv;
+                OUT.uv2          = IN.uv2;
                 return OUT;
             }
 
-            // Reconstruct the per-pixel world normal from the normal map sample.
-            float3 ApplyNormalMap(Varyings IN, float3 defaultNormalWS)
+            float3 ResolveNormal(Varyings IN)
             {
-#if _NORMALMAP
-                float2 nmUV = TRANSFORM_TEX(IN.uv, _NormalMap);
-                float4 nmSample = SAMPLE_TEXTURE2D(_NormalMap, sampler_NormalMap, nmUV);
-                // UnpackNormalScale works with both DXT5nm (AG) and RGB normal maps.
-                float3 tsNormal = UnpackNormalScale(nmSample, _BumpScale);
-                // TBN matrix: columns are tangent, bitangent, normal in world space.
-                float3 N = normalize(
-                    tsNormal.x * normalize(IN.tangentWS) +
-                    tsNormal.y * normalize(IN.bitangentWS) +
-                    tsNormal.z * normalize(IN.normalWS));
-                return N;
-#else
-                return normalize(defaultNormalWS);
-#endif
+                // Всегда сэмплируем normal map (bump = flat normal если не назначен)
+                float4 s  = SAMPLE_TEXTURE2D(_NormalMap, sampler_NormalMap, TRANSFORM_TEX(IN.uv, _NormalMap));
+                float3 ts = UnpackNormalScale(s, _BumpScale);
+                return normalize(ts.x * IN.tangentWS + ts.y * IN.bitangentWS + ts.z * IN.normalWS);
             }
 
             float2 WrapWoTUV(float2 uv)
             {
-                const float mn   = 0.0625;
-                const float mx   = 0.9375;
-                const float span = mx - mn;
+                const float mn = 0.0625, mx = 0.9375, span = mx - mn;
                 return mn + frac((uv - mn) / span) * span;
             }
-
             float2 AtlasCellUV(float index, float2 localUV)
             {
-                float cols = max(_AtlasGrid.x, 1.0);
-                float rows = max(_AtlasGrid.y, 1.0);
+                float cols = max(_AtlasGrid.x, 1.0), rows = max(_AtlasGrid.y, 1.0);
                 float idx  = max(floor(index + 0.5), 0.0);
-                float y    = floor(idx / cols);
-                float x    = idx - y * cols;
+                float y = floor(idx / cols), x = idx - y * cols;
                 y = rows - 1.0 - y;
                 return (float2(x, y) + localUV) / float2(cols, rows);
             }
-
             float3 SampleAtlasTile(float index, float2 uv)
             {
-                float2 local = WrapWoTUV(uv);
-                return SAMPLE_TEXTURE2D(_AtlasTex, sampler_MainTex, AtlasCellUV(index, local)).rgb;
+                return SAMPLE_TEXTURE2D(_AtlasTex, sampler_MainTex, AtlasCellUV(index, WrapWoTUV(uv))).rgb;
             }
-
-            float2 BlendUV(Varyings IN)
+            float4 SampleAtlasBlend(float2 uv)
             {
-                return _UseUv2Blend > 0.5 ? IN.uv2 : IN.uv;
+                return SAMPLE_TEXTURE2D(_AtlasBlend, sampler_MainTex, AtlasCellUV(_AtlasIndexes.w, uv));
             }
-
-            float4 SampleAtlasBlend(float2 blendUv)
-            {
-                return SAMPLE_TEXTURE2D(_AtlasBlend, sampler_MainTex, AtlasCellUV(_AtlasIndexes.w, blendUv));
-            }
-
-            float3 Shade(float3 albedo, float3 normalWS)
-            {
-                float3 n    = normalize(normalWS);
-                Light mainLight = GetMainLight();
-                float ndotl = saturate(dot(n, mainLight.direction));
-                float3 ambient = SampleSH(n);
-                return albedo * (mainLight.color * ndotl + ambient + 0.15) * _Brightness;
-            }
+            float2 BlendUV(Varyings IN) { return _UseUv2Blend > 0.5 ? IN.uv2 : IN.uv; }
 
             half4 frag(Varyings IN) : SV_Target
             {
-                float2 uv = TRANSFORM_TEX(IN.uv, _MainTex);
+                UNITY_SETUP_INSTANCE_ID(IN);
+
                 float3 albedo;
+                float2 uv = TRANSFORM_TEX(IN.uv, _MainTex);
 
                 if (_Mode < 0.5)
                 {
@@ -190,46 +156,52 @@ Shader "WoT/ObjectPBS"
                 }
                 else if (_Mode < 1.5)
                 {
-                    float2 tileUV  = IN.uv;
-                    float2 blendUV = BlendUV(IN);
-                    float4 blend = SAMPLE_TEXTURE2D(_BlendMask, sampler_MainTex, TRANSFORM_TEX(blendUV, _BlendMask));
-                    float3 c0 = SAMPLE_TEXTURE2D(_Tile0, sampler_MainTex, TRANSFORM_TEX(tileUV, _Tile0)).rgb * _Tile0Tint.rgb;
-                    float3 c1 = SAMPLE_TEXTURE2D(_Tile1, sampler_MainTex, TRANSFORM_TEX(tileUV, _Tile1)).rgb * _Tile1Tint.rgb;
-                    float3 c2 = SAMPLE_TEXTURE2D(_Tile2, sampler_MainTex, TRANSFORM_TEX(tileUV, _Tile2)).rgb * _Tile2Tint.rgb;
+                    float4 blend = SAMPLE_TEXTURE2D(_BlendMask, sampler_MainTex, TRANSFORM_TEX(BlendUV(IN), _BlendMask));
+                    float3 c0 = SAMPLE_TEXTURE2D(_Tile0, sampler_MainTex, TRANSFORM_TEX(IN.uv, _Tile0)).rgb * _Tile0Tint.rgb;
+                    float3 c1 = SAMPLE_TEXTURE2D(_Tile1, sampler_MainTex, TRANSFORM_TEX(IN.uv, _Tile1)).rgb * _Tile1Tint.rgb;
+                    float3 c2 = SAMPLE_TEXTURE2D(_Tile2, sampler_MainTex, TRANSFORM_TEX(IN.uv, _Tile2)).rgb * _Tile2Tint.rgb;
                     albedo = c0 * blend.r + c1 * blend.g + c2 * blend.b;
-                    if (dot(blend.rgb, float3(1.0, 1.0, 1.0)) <= 1e-4) albedo = c0;
+                    if (dot(blend.rgb, 1.0) <= 1e-4) albedo = c0;
                     albedo *= _ObjectColor.rgb;
                 }
                 else if (_Mode < 2.5)
                 {
                     float4 blend = SampleAtlasBlend(BlendUV(IN));
-                    float w0 = blend.r;
-                    float w1 = blend.g;
-                    float w2 = saturate(1.0 - w0 - w1);
-                    float3 c0 = SampleAtlasTile(_AtlasIndexes.x, IN.uv) * _Tile0Tint.rgb;
-                    float3 c1 = SampleAtlasTile(_AtlasIndexes.y, IN.uv) * _Tile1Tint.rgb;
-                    float3 c2 = SampleAtlasTile(_AtlasIndexes.z, IN.uv) * _Tile2Tint.rgb;
-                    albedo = c0 * w0 + c1 * w1 + c2 * w2;
+                    float w0 = blend.r, w1 = blend.g, w2 = saturate(1.0 - w0 - w1);
+                    albedo = SampleAtlasTile(_AtlasIndexes.x, IN.uv) * _Tile0Tint.rgb * w0
+                           + SampleAtlasTile(_AtlasIndexes.y, IN.uv) * _Tile1Tint.rgb * w1
+                           + SampleAtlasTile(_AtlasIndexes.z, IN.uv) * _Tile2Tint.rgb * w2;
                     albedo *= _ObjectColor.rgb;
                 }
                 else
                 {
-                    float2 tileUV = WrapWoTUV(IN.uv);
-                    float4 blend  = SampleAtlasBlend(BlendUV(IN));
-                    float w0 = blend.r;
-                    float w1 = blend.g;
-                    float w2 = saturate(1.0 - w0 - w1);
-                    float3 c0 = SAMPLE_TEXTURE2D(_Tile0, sampler_MainTex, TRANSFORM_TEX(tileUV, _Tile0)).rgb * _Tile0Tint.rgb;
-                    float3 c1 = SAMPLE_TEXTURE2D(_Tile1, sampler_MainTex, TRANSFORM_TEX(tileUV, _Tile1)).rgb * _Tile1Tint.rgb;
-                    float3 c2 = SAMPLE_TEXTURE2D(_Tile2, sampler_MainTex, TRANSFORM_TEX(tileUV, _Tile2)).rgb * _Tile2Tint.rgb;
-                    albedo = c0 * w0 + c1 * w1 + c2 * w2;
+                    float4 blend = SampleAtlasBlend(BlendUV(IN));
+                    float w0 = blend.r, w1 = blend.g, w2 = saturate(1.0 - w0 - w1);
+                    float2 tuv = WrapWoTUV(IN.uv);
+                    albedo = SAMPLE_TEXTURE2D(_Tile0, sampler_MainTex, TRANSFORM_TEX(tuv, _Tile0)).rgb * _Tile0Tint.rgb * w0
+                           + SAMPLE_TEXTURE2D(_Tile1, sampler_MainTex, TRANSFORM_TEX(tuv, _Tile1)).rgb * _Tile1Tint.rgb * w1
+                           + SAMPLE_TEXTURE2D(_Tile2, sampler_MainTex, TRANSFORM_TEX(tuv, _Tile2)).rgb * _Tile2Tint.rgb * w2;
                     albedo *= _ObjectColor.rgb;
                 }
 
-                // Reconstruct final normal (mesh normal or normal-mapped)
-                float3 finalNormal = ApplyNormalMap(IN, IN.normalWS);
+                float3 nWS = ResolveNormal(IN);
 
-                return half4(Shade(albedo, finalNormal), _ObjectColor.a);
+                // GetMainLight с shadow координатами — URP семплирует shadow map
+                // Вычисляем shadowCoord в fragment — точный каскад без видимых кругов
+                #if defined(_MAIN_LIGHT_SHADOWS_SCREEN)
+                    float4 shadowCoord = ComputeScreenPos(TransformWorldToHClip(IN.positionWS));
+                #elif defined(_MAIN_LIGHT_SHADOWS) || defined(_MAIN_LIGHT_SHADOWS_CASCADE)
+                    float4 shadowCoord = TransformWorldToShadowCoord(IN.positionWS);
+                #else
+                    float4 shadowCoord = float4(0,0,0,0);
+                #endif
+                Light mainLight = GetMainLight(shadowCoord);
+                float ndotl = saturate(dot(nWS, mainLight.direction));
+                // mainLight.shadowAttenuation содержит затенение от теней (0=тень, 1=свет)
+                float3 lit = albedo * (mainLight.color * ndotl * mainLight.shadowAttenuation
+                                     + SampleSH(nWS) * 0.5 + 0.15) * _Brightness;
+                lit = MixFog(lit, IN.fogFactor);
+                return half4(lit, _ObjectColor.a);
             }
             ENDHLSL
         }
@@ -242,12 +214,75 @@ Shader "WoT/ObjectPBS"
             Cull Back
 
             HLSLPROGRAM
-            #pragma vertex shadowVert
-            #pragma fragment shadowFrag
+            #pragma vertex ShadowVert
+            #pragma fragment ShadowFrag
             #pragma target 3.0
+            #pragma multi_compile_instancing
+            #pragma multi_compile_vertex _ _CASTING_PUNCTUAL_LIGHT_SHADOW
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/ShadowCasterPass.hlsl"
+
+            // Bias значения — стандартные для URP
+            // Depth bias: отодвигает shadow map от поверхности
+            // Normal bias: смещает вдоль нормали чтобы убрать "сферу" вокруг объектов
+            float3 _LightDirection;
+            float3 _LightPosition;
+
+            struct ShadowAttr
+            {
+                float4 positionOS : POSITION;
+                float3 normalOS   : NORMAL;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
+            struct ShadowVary
+            {
+                float4 positionCS : SV_POSITION;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
+
+            float3 ApplyShadowBiasWS(float3 posWS, float3 normalWS, float3 lightDir)
+            {
+                // Normal bias: сдвиг вдоль нормали пропорционально углу света
+                // Убирает "тёмную сферу" вокруг камеры и self-shadowing
+                float normalBias = 0.02;
+                float depthBias  = 0.001;
+                float invNdotL   = 1.0 - saturate(dot(normalWS, lightDir));
+                posWS += normalWS * invNdotL * normalBias;
+                posWS -= lightDir * depthBias;
+                return posWS;
+            }
+
+            ShadowVary ShadowVert(ShadowAttr IN)
+            {
+                ShadowVary OUT;
+                UNITY_SETUP_INSTANCE_ID(IN);
+                UNITY_TRANSFER_INSTANCE_ID(IN, OUT);
+
+                float3 posWS = TransformObjectToWorld(IN.positionOS.xyz);
+                float3 nrmWS = TransformObjectToWorldNormal(IN.normalOS);
+
+            #if _CASTING_PUNCTUAL_LIGHT_SHADOW
+                float3 lightDir = normalize(_LightPosition - posWS);
+            #else
+                float3 lightDir = _LightDirection;
+            #endif
+
+                posWS = ApplyShadowBiasWS(posWS, nrmWS, lightDir);
+
+                float4 posCS = TransformWorldToHClip(posWS);
+
+                // Зажимаем z чтобы убрать пропадание теней на near plane
+            #if UNITY_REVERSED_Z
+                posCS.z = min(posCS.z, posCS.w * UNITY_NEAR_CLIP_VALUE);
+            #else
+                posCS.z = max(posCS.z, posCS.w * UNITY_NEAR_CLIP_VALUE);
+            #endif
+
+                OUT.positionCS = posCS;
+                return OUT;
+            }
+
+            half4 ShadowFrag(ShadowVary IN) : SV_Target { return 0; }
             ENDHLSL
         }
     }
