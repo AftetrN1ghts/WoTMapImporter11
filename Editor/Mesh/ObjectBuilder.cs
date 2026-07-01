@@ -547,7 +547,7 @@ namespace WoTMapImporter.Editor.Mesh
         private static void SetupTiledMaterial(BuildContext ctx, Material mat, CompiledSpace.RenderMesh renderMesh)
         {
             if (mat.HasProperty("_Mode")) mat.SetFloat("_Mode", 1f);
-            Texture2D t0    = LoadTextureFromProp(ctx, renderMesh, "albedoHeightTile0", false);
+            Texture2D t0    = LoadTextureFromProp(ctx, renderMesh, "albedoHeightTile0", false) ?? LoadTextureFromProp(ctx, renderMesh, "diffuseMap", false) ?? LoadTextureFromProp(ctx, renderMesh, "albedoMap", false);
             Texture2D t1    = LoadTextureFromProp(ctx, renderMesh, "albedoHeightTile1", false);
             Texture2D t2    = LoadTextureFromProp(ctx, renderMesh, "albedoHeightTile2", false);
             Texture2D blend = LoadTextureFromProp(ctx, renderMesh, "blendMask",         true, true);
@@ -575,7 +575,7 @@ namespace WoTMapImporter.Editor.Mesh
             SetVectorIfExists(mat, "_Tile1Tint", ToVector4(renderMesh.GetVector("g_tile1Tint"), Color.white));
             SetVectorIfExists(mat, "_Tile2Tint", ToVector4(renderMesh.GetVector("g_tile2Tint"), Color.white));
 
-            string atlasName = renderMesh.GetString("atlasAlbedoHeight");
+            string atlasName = renderMesh.GetString("atlasAlbedoHeight") ?? renderMesh.GetString("diffuseMap") ?? renderMesh.GetString("albedoMap");
             bool loadedFromAtlas = false;
             if (!string.IsNullOrEmpty(atlasName) && atlasName.EndsWith(".atlas", StringComparison.OrdinalIgnoreCase))
             {
@@ -597,7 +597,7 @@ namespace WoTMapImporter.Editor.Mesh
                 if (t != null) { SetTextureIfExists(mat, "_Tile0", t); SetTextureIfExists(mat, "_Tile1", t); SetTextureIfExists(mat, "_Tile2", t); SetTextureIfExists(mat, "_MainTex", t); SetTextureIfExists(mat, "_BaseMap", t); }
             }
 
-            Texture2D blend = LoadTextureFromProp(ctx, renderMesh, "atlasBlend", true, true);
+            Texture2D blend = LoadTextureFromProp(ctx, renderMesh, "atlasBlend", true, true) ?? LoadTextureFromProp(ctx, renderMesh, "blendMask", true, true);
             if (blend != null) { SetTextureIfExists(mat, "_AtlasBlend", blend); SetTextureIfExists(mat, "_BlendMask", blend); }
             if (mat.HasProperty("_Mode")) mat.SetFloat("_Mode", 3f);
         }
@@ -815,7 +815,11 @@ namespace WoTMapImporter.Editor.Mesh
             if (!n.StartsWith("content/", StringComparison.OrdinalIgnoreCase)) candidates.Add("content/" + n);
             if (!n.EndsWith("_processed", StringComparison.OrdinalIgnoreCase) && n.EndsWith(".primitives", StringComparison.OrdinalIgnoreCase))
                 candidates.Add(n + "_processed");
+            if (n.EndsWith("_processed", StringComparison.OrdinalIgnoreCase))
+                candidates.Add(n.Substring(0, n.Length - 10)); // remove _processed
             candidates.Add(Path.GetFileName(n));
+            if (n.EndsWith("_processed", StringComparison.OrdinalIgnoreCase))
+                candidates.Add(Path.GetFileName(n.Substring(0, n.Length - 10)));
             foreach (var c in candidates) { var d = resMgr.ReadBytes(c); if (d != null) return d; }
             return null;
         }

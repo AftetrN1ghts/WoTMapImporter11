@@ -175,12 +175,11 @@ Shader "WoT/ObjectPBS"
                 }
                 else
                 {
-                    float4 blend = SampleAtlasBlend(BlendUV(IN));
+                    float4 blend = SAMPLE_TEXTURE2D(_BlendMask, sampler_MainTex, TRANSFORM_TEX(BlendUV(IN), _BlendMask));
                     float w0 = blend.r, w1 = blend.g, w2 = saturate(1.0 - w0 - w1);
-                    float2 tuv = WrapWoTUV(IN.uv);
-                    albedo = SAMPLE_TEXTURE2D(_Tile0, sampler_MainTex, TRANSFORM_TEX(tuv, _Tile0)).rgb * _Tile0Tint.rgb * w0
-                           + SAMPLE_TEXTURE2D(_Tile1, sampler_MainTex, TRANSFORM_TEX(tuv, _Tile1)).rgb * _Tile1Tint.rgb * w1
-                           + SAMPLE_TEXTURE2D(_Tile2, sampler_MainTex, TRANSFORM_TEX(tuv, _Tile2)).rgb * _Tile2Tint.rgb * w2;
+                    albedo = SAMPLE_TEXTURE2D(_Tile0, sampler_MainTex, TRANSFORM_TEX(IN.uv, _Tile0)).rgb * _Tile0Tint.rgb * w0
+                           + SAMPLE_TEXTURE2D(_Tile1, sampler_MainTex, TRANSFORM_TEX(IN.uv, _Tile1)).rgb * _Tile1Tint.rgb * w1
+                           + SAMPLE_TEXTURE2D(_Tile2, sampler_MainTex, TRANSFORM_TEX(IN.uv, _Tile2)).rgb * _Tile2Tint.rgb * w2;
                     albedo *= _ObjectColor.rgb;
                 }
 
